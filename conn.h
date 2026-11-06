@@ -49,6 +49,7 @@ typedef struct {
     Buffer from_client;  // The request's head, then its body.
     size_t head_length;  // Of the head in from_client, once it's all in.
     Request request;
+    Buffer upstream_uri;  // With a NUL after it, once there's a location.
     Buffer to_upstream;
     Buffer from_upstream;  // What's come from the upstream, until it's used.
     Buffer to_client;

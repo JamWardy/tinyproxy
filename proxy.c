@@ -4,6 +4,8 @@
 #include <string.h>
 #include <strings.h>
 
+#include "uri.h"
+
 // ---- The request ----
 
 static int append_header(Buffer *out, const char *name, const char *value,
@@ -37,11 +39,31 @@ static int is_replaced(const Headers *proxy_headers, const char *name) {
     return 0;
 }
 
+int build_upstream_uri(Buffer *out, const Request *request,
+                       const Location *location) {
+    const char *replacement = location->proxy_pass.uri;
+
+    if (!replacement) {
+        return buffer_append_text(out, request->path);
+    }
+    size_t matched = location->match == LOCATION_EXACT
+                         ? strlen(request->uri)
+                         : strlen(location->path);
+    int ok = buffer_append_text(out, replacement) &&
+             append_escaped_uri(out, request->uri + matched);
+    if (ok && request->args && *request->args) {
+        ok = buffer_append(out, "?", 1) &&
+             buffer_append_text(out, request->args);
+    }
+    return ok;
+}
+
 int build_upstream_request(Buffer *out, const Request *request,
-                           int version, const Headers *proxy_headers,
+                           const char *uri, int version,
+                           const Headers *proxy_headers,
                            const Variables *variables, const char *body) {
-    if (!buffer_appendf(out, "%s %s HTTP/%d.%d\r\n", request->method,
-                        request->path, version / 1000, version % 1000)) {
+    if (!buffer_appendf(out, "%s %s HTTP/%d.%d\r\n", request->method, uri,
+                        version / 1000, version % 1000)) {
         return 0;
     }
     for (size_t i = 0; i < proxy_headers->count; i++) {

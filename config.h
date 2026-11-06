@@ -64,13 +64,20 @@ typedef struct {
 } Settings;
 
 typedef struct {
-    const char *url;   // As written, for the error log.
-    const char *host;  // $proxy_host: the host and port as written.
+    char *origin;      // "http://host:port" as written, without the path.
+    const char *host;  // $proxy_host: the host and port, inside origin.
+    const char *uri;   // The path written after them, or NULL.
     struct sockaddr_in address;
 } ProxyPass;
 
+typedef enum {
+    LOCATION_PREFIX,  // "location /path" or "location ^~ /path".
+    LOCATION_EXACT,   // "location = /path".
+} LocationMatch;
+
 typedef struct {
-    const char *prefix;
+    LocationMatch match;
+    const char *path;
     int has_proxy_pass;
     ProxyPass proxy_pass;  // has_proxy_pass's.
     // What's sent upstream: nginx's defaults, with proxy_set_header's on top.

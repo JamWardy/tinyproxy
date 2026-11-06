@@ -13,6 +13,7 @@
 #include "http.h"
 #include "log.h"
 #include "proxy.h"
+#include "route.h"
 #include "variables.h"
 
 // nginx's lingering_time and lingering_timeout.
@@ -62,6 +63,7 @@ static void release(Connection *conn) {
     enter(conn, CONN_UNUSED);
     close(conn->client_fd);
     buffer_free(&conn->from_client);
+    buffer_free(&conn->upstream_uri);
     buffer_free(&conn->to_upstream);
     buffer_free(&conn->from_upstream);
     buffer_free(&conn->to_client);
@@ -113,9 +115,9 @@ static void log_conn_error(const Connection *conn, const char *format, ...) {
               conn->number, message, conn->remote_addr,
               request->line ? request->line : "",
               location && location->has_proxy_pass
-                  ? location->proxy_pass.url
+                  ? location->proxy_pass.origin
                   : "",
-              location && location->has_proxy_pass ? request->path : "",
+              buffer_bytes(&conn->upstream_uri),
               request->host ? request->host : "");
 }
 
@@ -153,14 +155,15 @@ static Received receive(int fd, Buffer *into, int *error_number) {
 }
 
 // tinyproxy's own reply in place of anything else, closing the upstream
-// connection if there is one.
-static void reply_error(Connection *conn, int status, double now) {
+// connection if there is one. redirect is a 301's Location, or NULL.
+static void reply_own(Connection *conn, int status, const char *redirect,
+                      double now) {
     const char *method = conn->request.method;
     int with_body = !(method && strcmp(method, "HEAD") == 0);
 
     enter(conn, CONN_SENDING_ERROR);
     buffer_clear(&conn->to_client);
-    if (!build_error_reply(&conn->to_client, status, with_body)) {
+    if (!build_error_reply(&conn->to_client, status, with_body, redirect)) {
         release(conn);
         return;
     }
@@ -168,6 +171,10 @@ static void reply_error(Connection *conn, int status, double now) {
     conn->reply_head_length = find_reply_head(buffer_bytes(&conn->to_client),
                                               buffer_length(&conn->to_client));
     conn->client_io_at = now;
+}
+
+static void reply_error(Connection *conn, int status, double now) {
+    reply_own(conn, status, NULL, now);
 }
 
 // Something went wrong upstream before the reply's head was in.
@@ -223,21 +230,46 @@ static void send_to_client(Connection *conn, double now) {
 
 // ---- The request ----
 
-// A prefix of the path, not counting any query.
-static int location_matches(const Location *location, const char *path) {
-    size_t prefix_length = strlen(location->prefix);
+// nginx's absolute_redirect: "http://", $host or else the address the
+// client reached, the port unless it's 80, then the location's path and the
+// query. Fails only when out of memory, or if the socket has no address.
+static int build_redirect(const Connection *conn, const Location *location,
+                          Buffer *out) {
+    const Request *request = &conn->request;
+    struct sockaddr_in local;
+    socklen_t length = sizeof(local);
+    char address[INET_ADDRSTRLEN];
+    const char *host = request->host;
 
-    return strncmp(path, location->prefix, prefix_length) == 0 &&
-           prefix_length <= strcspn(path, "?");
+    if (getsockname(conn->client_fd, (struct sockaddr *)&local, &length) !=
+        0) {
+        return 0;
+    }
+    if (*host == '\0') {
+        inet_ntop(AF_INET, &local.sin_addr, address, sizeof(address));
+        host = address;
+    }
+    unsigned port = ntohs(local.sin_port);
+
+    return buffer_appendf(out, "http://%s", host) &&
+           (port == 80 || buffer_appendf(out, ":%u", port)) &&
+           buffer_append_text(out, location->path) &&
+           (!request->args || !*request->args ||
+            buffer_appendf(out, "?%s", request->args)) &&
+           buffer_append(out, "", 1);
 }
 
-static const Location *find_location(const Server *server, const char *path) {
-    for (size_t i = 0; i < server->location_count; i++) {
-        if (location_matches(&server->locations[i], path)) {
-            return &server->locations[i];
-        }
+static void reply_redirect(Connection *conn, const Location *location,
+                           double now) {
+    Buffer url;
+
+    buffer_init(&url);
+    if (build_redirect(conn, location, &url)) {
+        reply_own(conn, 301, buffer_bytes(&url), now);
+    } else {
+        reply_error(conn, 500, now);
     }
-    return NULL;
+    buffer_free(&url);
 }
 
 static int body_received(const Connection *conn) {
@@ -273,6 +305,7 @@ static int build_request(Connection *conn) {
         variables.proxy_add_x_forwarded_for = buffer_bytes(&forwarded);
         ok = build_upstream_request(
             &conn->to_upstream, &conn->request,
+            buffer_bytes(&conn->upstream_uri),
             conn->settings->proxy_http_version, &location->proxy_headers,
             &variables, buffer_bytes(&conn->from_client) + conn->head_length);
     }
@@ -311,17 +344,28 @@ static void connect_upstream(Connection *conn, double now) {
 }
 
 static void start_request(Connection *conn, double now) {
-    const Location *location = find_location(conn->server,
-                                             conn->request.path);
+    Route route = find_route(conn->server, conn->request.uri);
 
-    if (!location) {
+    if (route.kind == ROUTE_NONE) {
         reply_error(conn, 404, now);
         return;
     }
+    const Location *location = route.location;
     conn->location = location;
     conn->settings = &location->settings;
+    if (route.kind == ROUTE_REDIRECT) {
+        reply_redirect(conn, location, now);
+        return;
+    }
     if (!location->has_proxy_pass) {
         reply_error(conn, 404, now);
+        return;
+    }
+    // Built now, so the error log can show it from here on. The NUL makes
+    // its bytes a string.
+    if (!build_upstream_uri(&conn->upstream_uri, &conn->request, location) ||
+        !buffer_append(&conn->upstream_uri, "", 1)) {
+        reply_error(conn, 500, now);
         return;
     }
 
@@ -609,6 +653,7 @@ void conn_start(Connection *conn, int fd, const struct sockaddr_in *peer,
     buffer_init(&conn->from_client);
     conn->head_length = 0;
     request_init(&conn->request);
+    buffer_init(&conn->upstream_uri);
     buffer_init(&conn->to_upstream);
     buffer_init(&conn->from_upstream);
     buffer_init(&conn->to_client);

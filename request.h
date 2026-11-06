@@ -32,6 +32,8 @@ typedef struct {
     const char *method;
     const char *target;
     const char *path;  // The target without any "http://host" before it.
+    char *uri;         // nginx's $uri: the path normalised, without a query.
+    const char *args;  // nginx's $args: the query after '?', or NULL.
     int version;
     char *host;  // $host: lowercased, without the port; "" if none.
     Header *headers;  // Only those with names nginx passes on.

@@ -13,6 +13,8 @@ tinyproxy/
   proxy.c/.h      the request as it goes upstream, the reply as it comes
                   back
   chunked.c/.h    decoding a chunked reply
+  uri.c/.h        normalising the path, and escaping it again
+  route.c/.h      choosing the location
   variables.c/.h  $host and the others, for proxy_set_header
   error_page.c/.h tinyproxy's own replies and nginx's pages
   http.c/.h       what those share: header types, versions, line helpers
@@ -40,8 +42,18 @@ tinyproxy/
 
 ## Stages 2 to 7
 
-- [ ] 2: path routing, `location =` and prefixes, and the path in
-      `proxy_pass`
+- [x] 2: path routing, as in `DESIGN.md`:
+  - [x] Several `location`s, `location =`, `^~`, duplicates and
+        nested ones refused
+  - [x] A path in `proxy_pass`
+  - [x] Normalising the path into `$uri`, in `uri.c`
+  - [x] Matching, exact then the longest prefix, and the trailing-slash
+        `301`, in `route.c`
+  - [x] Rewriting the URI sent upstream
+  - [x] Try it by hand: exact against prefix, the longest prefix,
+        `/search/../orders`, `%2e%2e`, a path in `proxy_pass` with a
+        query, no match (`404`), the `301`, a duplicate location, then
+        the shop's routes with `curl` to each service
 - [ ] 3: host routing, `server_name` and `default_server`
 - [ ] 4: `upstream` blocks
 - [ ] 5: keep-alive, `keepalive` in `upstream` blocks and

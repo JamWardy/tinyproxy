@@ -12,6 +12,7 @@ typedef struct {
 } ErrorPage;
 
 static const ErrorPage ERROR_PAGES[] = {
+    {301, "301 Moved Permanently", "301 Moved Permanently", NULL},
     {400, "400 Bad Request", "400 Bad Request", NULL},
     {404, "404 Not Found", "404 Not Found", NULL},
     {408, "408 Request Time-out", "408 Request Time-out", NULL},
@@ -39,7 +40,8 @@ static const ErrorPage *find_error_page(int status) {
     return NULL;
 }
 
-int build_error_reply(Buffer *out, int status, int with_body) {
+int build_error_reply(Buffer *out, int status, int with_body,
+                      const char *location) {
     const ErrorPage *page = find_error_page(status);
     char date[40];
     Buffer html;
@@ -65,10 +67,11 @@ int build_error_reply(Buffer *out, int status, int with_body) {
                               "Server: tinyproxy\r\n"
                               "Date: %s\r\n"
                               "Content-Type: text/html\r\n"
-                              "Content-Length: %zu\r\n"
-                              "Connection: close\r\n"
-                              "\r\n",
-                              page->status_line, date, buffer_length(&html));
+                              "Content-Length: %zu\r\n",
+                              page->status_line, date, buffer_length(&html)) &&
+         (!location ||
+          buffer_appendf(out, "Location: %s\r\n", location)) &&
+         buffer_append_text(out, "Connection: close\r\n\r\n");
     if (ok && with_body) {
         ok = buffer_append(out, buffer_bytes(&html), buffer_length(&html));
     }

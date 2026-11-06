@@ -500,33 +500,45 @@ static int handle_location(Parser *parser, const Scope *scope,
                            const Directive *directive,
                            const DirectiveSpec *spec) {
     Server *server = scope->server;
+    LocationMatch match = LOCATION_PREFIX;
+    const char *path = directive->arguments[0];
 
     (void)spec;
-    if (server->location_count > 0) {
+    if (scope->context == CONTEXT_LOCATION) {
         return parse_error(parser, directive->line,
-                           "a second \"location\" is not supported until "
-                           "stage 2");
+                           "a \"location\" inside another is not supported");
     }
+    // With no regex locations, ^~ has none to stop, so it's a plain prefix.
     if (directive->argument_count == 2) {
         if (strcmp(directive->arguments[0], "=") == 0) {
+            match = LOCATION_EXACT;
+        } else if (strcmp(directive->arguments[0], "^~") != 0) {
             return parse_error(parser, directive->line,
-                               "\"location =\" is not supported until "
-                               "stage 2");
+                               "location modifier \"%s\" is not supported",
+                               directive->arguments[0]);
         }
-        return parse_error(parser, directive->line,
-                           "location modifier \"%s\" is not supported",
-                           directive->arguments[0]);
+        path = directive->arguments[1];
+    }
+    for (size_t i = 0; i < server->location_count; i++) {
+        if (server->locations[i].match == match &&
+            strcmp(server->locations[i].path, path) == 0) {
+            return parse_error(parser, directive->line,
+                               "duplicate location \"%s\"", path);
+        }
     }
 
-    Location *location = malloc(sizeof(Location));
-    if (!location) {
+    Location *locations = realloc(
+        server->locations, (server->location_count + 1) * sizeof(Location));
+    if (!locations) {
         return out_of_memory(parser, directive);
     }
+    server->locations = locations;
+    // Locations can't nest, so no more are added while this block is read.
+    Location *location = &locations[server->location_count++];
     memset(location, 0, sizeof(*location));
-    location->prefix = directive->arguments[0];
+    location->match = match;
+    location->path = path;
     block_settings_init(&location->written);
-    server->locations = location;
-    server->location_count = 1;
 
     Scope inner = {CONTEXT_LOCATION, server, location, &location->written};
     return parse_block(parser, &inner);
@@ -584,7 +596,7 @@ static int handle_listen(Parser *parser, const Scope *scope,
     return 1;
 }
 
-// "http://host:port". A path after it is stage 2's.
+// "http://host:port", and perhaps a path after it.
 static int handle_proxy_pass(Parser *parser, const Scope *scope,
                              const Directive *directive,
                              const DirectiveSpec *spec) {
@@ -601,12 +613,18 @@ static int handle_proxy_pass(Parser *parser, const Scope *scope,
         return parse_error(parser, directive->line,
                            "invalid URL prefix in \"%s\"", url);
     }
-    const char *authority = url + 7;
-    if (strchr(authority, '/')) {
-        return parse_error(parser, directive->line,
-                           "a path in \"proxy_pass\" is not supported until "
-                           "stage 2");
+    const char *uri = strchr(url + 7, '/');
+    size_t origin_length = uri ? (size_t)(uri - url) : strlen(url);
+    char *origin = malloc(origin_length + 1);
+    if (!origin) {
+        return out_of_memory(parser, directive);
     }
+    memcpy(origin, url, origin_length);
+    origin[origin_length] = '\0';
+    // Owned by the location from here, so freed with it even on failure.
+    location->proxy_pass.origin = origin;
+
+    const char *authority = origin + 7;
     if (strlen(authority) >= sizeof(host) ||
         !split_host_port(authority, host, &port)) {
         return parse_error(parser, directive->line,
@@ -620,8 +638,8 @@ static int handle_proxy_pass(Parser *parser, const Scope *scope,
         return parse_error(parser, directive->line,
                            "host not found in upstream \"%s\"", authority);
     }
-    location->proxy_pass.url = url;
     location->proxy_pass.host = authority;
+    location->proxy_pass.uri = uri;
     location->has_proxy_pass = 1;
     return 1;
 }
@@ -1078,6 +1096,7 @@ void config_free(Config *config) {
         Server *server = &config->servers[i];
 
         for (size_t j = 0; j < server->location_count; j++) {
+            free(server->locations[j].proxy_pass.origin);
             free(server->locations[j].proxy_headers.items);
             block_settings_free(&server->locations[j].written);
         }

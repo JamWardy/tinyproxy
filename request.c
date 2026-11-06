@@ -5,6 +5,8 @@
 #include <string.h>
 #include <strings.h>
 
+#include "uri.h"
+
 // ---- Finding the head ----
 
 static HeadScan head_complete(size_t length) {
@@ -176,12 +178,18 @@ static int parse_request_line(Request *request, char *line) {
     request->target = target;
     if (target[0] == '/') {
         request->path = target;
-        return 0;
+    } else if (strncasecmp(target, "http://", 7) == 0) {
+        status = parse_absolute_target(request, target + 7);
+        if (status) {
+            return status;
+        }
+    } else {
+        return 400;
     }
-    if (strncasecmp(target, "http://", 7) == 0) {
-        return parse_absolute_target(request, target + 7);
-    }
-    return 400;
+
+    const char *query = strchr(request->path, '?');
+    request->args = query ? query + 1 : NULL;
+    return normalise_uri(request->path, &request->uri);
 }
 
 static int parse_content_length(const char *text, size_t *length) {
@@ -298,6 +306,8 @@ void request_init(Request *request) {
     request->method = NULL;
     request->target = NULL;
     request->path = NULL;
+    request->uri = NULL;
+    request->args = NULL;
     request->version = 0;
     request->host = NULL;
     request->headers = NULL;
@@ -310,6 +320,7 @@ void request_free(Request *request) {
     free(request->line);
     free(request->head);
     free(request->host);
+    free(request->uri);
     free(request->headers);
     request_init(request);
 }

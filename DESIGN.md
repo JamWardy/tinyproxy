@@ -63,11 +63,9 @@ with the file and line, as nginx's `[emerg]` does. Each stage below
 adds its own directives.
 
 Until a stage adds them, it refuses what that stage brings in the same
-way: a second `location` in a `server` or a path in `proxy_pass`
-before stage 2, or a second
-`server` on the same port before stage 3. Several `server`s on
-different ports are fine from stage 1. A request that matches no
-`location` gets `404`.
+way: a second `server` on the same port before stage 3. Several
+`server`s on different ports are fine from stage 1. A request that
+matches no `location` gets `404`.
 
 ## The request
 
@@ -165,7 +163,26 @@ Each stage adds nginx's directives for it.
 2. **Path routing:** several `location`s in a `server`. `location =
    /path` matches exactly and is checked first; otherwise the longest
    matching prefix wins. With a path in `proxy_pass`, the part of the
-   URI that matched the location is replaced by it.
+   URI that matched the location is replaced by it. As in nginx:
+   - Locations match the normalised path, nginx's `$uri`: `%XX`
+     decoded, `//` merged, and `.` and `..` resolved, so
+     `/search/../orders` is `/orders`. A path that climbs above `/`, a
+     bad `%` escape or a `%00` gets `400`. The query isn't part of it.
+   - Matching is case-sensitive, as nginx's on Linux; on macOS nginx
+     ignores case, as the file system does.
+   - `^~ /path` is a prefix like any other, as there are no regex
+     locations for it to stop. Two locations with the same match stop
+     it starting: `duplicate location "/path"`.
+   - With a path in `proxy_pass`, what's sent is that path, then the
+     rest of `$uri` after the location's own path (all of it, for
+     `location =`), escaped again, then `?` and the query as it came.
+     Without one, the URI goes on as the client sent it.
+   - A prefix location that ends in `/` and has a `proxy_pass`, such as
+     `location /api/`, answers `/api` with `301` to `/api/`, keeping the
+     query. An exact `location = /api` takes it instead. The `Location`
+     is absolute, as nginx's `absolute_redirect`: `http://`, `$host`
+     (or the address it was reached on, if that's empty), the port
+     unless it's 80, and the path.
 3. **Host routing:** several `server`s on one port. `server_name`
    picks one by the `Host` header; with no match, the one marked
    `default_server` on its `listen`, or else the first.
@@ -207,6 +224,8 @@ Stages 9 and 10 are the gateway's.
 - No chunked request bodies; nginx accepts them. One gets `411`, as
   nginx's did before it did.
 - No regex `location`s (`~`) and no wildcard `server_name`s.
+- No `location` inside another; nginx allows them. One stops it
+  starting.
 - One `access_log` per block; nginx can write to several.
 - No keep-alive, with the client or the upstream, until stage 5.
 - `select()` can't wait on a file descriptor over 1023, so about a

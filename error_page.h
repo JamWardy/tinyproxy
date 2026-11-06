@@ -4,7 +4,9 @@
 #include "buffer.h"
 
 // tinyproxy's own reply for status, with nginx's HTML page unless the request
-// was a HEAD. Fails only when out of memory.
-int build_error_reply(Buffer *out, int status, int with_body);
+// was a HEAD, and a Location header unless location is NULL. Fails only when
+// out of memory.
+int build_error_reply(Buffer *out, int status, int with_body,
+                      const char *location);
 
 #endif
