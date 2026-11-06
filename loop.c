@@ -1,5 +1,6 @@
 #include "loop.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
@@ -17,7 +18,10 @@
 
 typedef struct {
     int fd;
-    const Server *server;
+    const ListenPort *port;
+    // NULL for a socket on every address, where each connection's group is
+    // found by the address it arrived on.
+    const AddressGroup *group;
 } Listener;
 
 typedef struct {
@@ -39,7 +43,7 @@ static double now_seconds(void) {
     return (double)now.tv_sec + (double)now.tv_nsec / 1e9;
 }
 
-static int open_listener(const Listen *where) {
+static int open_listener(const AddressGroup *where) {
     int yes = 1;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -69,11 +73,52 @@ static void close_listeners(Listeners *listeners) {
     free(listeners->items);
 }
 
+static const AddressGroup *every_address_group(const ListenPort *port) {
+    for (size_t i = 0; i < port->group_count; i++) {
+        if (port->groups[i].address.sin_addr.s_addr == htonl(INADDR_ANY)) {
+            return &port->groups[i];
+        }
+    }
+    return NULL;
+}
+
+static int add_listener(Listeners *listeners, const ListenPort *port,
+                        const AddressGroup *bound, const AddressGroup *group) {
+    int fd = open_listener(bound);
+
+    if (fd < 0) {
+        return 0;
+    }
+    listeners->items[listeners->count].fd = fd;
+    listeners->items[listeners->count].port = port;
+    listeners->items[listeners->count].group = group;
+    listeners->count++;
+    return 1;
+}
+
+// As nginx: a port with any server on every address gets one socket there,
+// which takes the other addresses' connections too; otherwise each address
+// gets its own.
+static int open_port(Listeners *listeners, const ListenPort *port) {
+    const AddressGroup *every = every_address_group(port);
+
+    if (every) {
+        return add_listener(listeners, port, every, NULL);
+    }
+    for (size_t i = 0; i < port->group_count; i++) {
+        if (!add_listener(listeners, port, &port->groups[i],
+                          &port->groups[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int open_listeners(const Config *config, Listeners *listeners) {
     size_t total = 0;
 
-    for (size_t i = 0; i < config->server_count; i++) {
-        total += config->servers[i].listen_count;
+    for (size_t i = 0; i < config->port_count; i++) {
+        total += config->ports[i].group_count;
     }
     listeners->count = 0;
     listeners->items = malloc((total ? total : 1) * sizeof(Listener));
@@ -82,21 +127,30 @@ static int open_listeners(const Config *config, Listeners *listeners) {
         return 0;
     }
 
-    for (size_t i = 0; i < config->server_count; i++) {
-        const Server *server = &config->servers[i];
-
-        for (size_t j = 0; j < server->listen_count; j++) {
-            int fd = open_listener(&server->listens[j]);
-            if (fd < 0) {
-                close_listeners(listeners);
-                return 0;
-            }
-            listeners->items[listeners->count].fd = fd;
-            listeners->items[listeners->count].server = server;
-            listeners->count++;
+    for (size_t i = 0; i < config->port_count; i++) {
+        if (!open_port(listeners, &config->ports[i])) {
+            close_listeners(listeners);
+            return 0;
         }
     }
     return 1;
+}
+
+// The group for the address a connection on an every-address socket
+// arrived on, or the every-address group if that address has none.
+static const AddressGroup *arrival_group(const ListenPort *port, int fd) {
+    struct sockaddr_in local;
+    socklen_t length = sizeof(local);
+
+    if (getsockname(fd, (struct sockaddr *)&local, &length) == 0) {
+        for (size_t i = 0; i < port->group_count; i++) {
+            if (port->groups[i].address.sin_addr.s_addr ==
+                local.sin_addr.s_addr) {
+                return &port->groups[i];
+            }
+        }
+    }
+    return every_address_group(port);
 }
 
 static Connection *free_slot(Connection *connections) {
@@ -130,7 +184,10 @@ static void accept_connections(const Listener *listener,
             close(fd);
             continue;
         }
-        conn_start(conn, fd, &peer, listener->server, now);
+        const AddressGroup *group = listener->group
+                                        ? listener->group
+                                        : arrival_group(listener->port, fd);
+        conn_start(conn, fd, &peer, group, now);
     }
 }
 

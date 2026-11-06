@@ -40,8 +40,10 @@ typedef struct {
     int upstream_fd;            // From CONN_CONNECTING to CONN_READING_REPLY.
     char remote_addr[INET_ADDRSTRLEN];
 
-    // Borrowed from the config. The settings are the server's until the
+    // Borrowed from the config. The server is the group's default until the
+    // request's Host picks one. The settings are the server's until the
     // request has a location, then the location's.
+    const AddressGroup *group;
     const Server *server;
     const Location *location;  // NULL until then.
     const Settings *settings;
@@ -70,7 +72,7 @@ typedef struct {
 int set_non_blocking(int fd);
 
 void conn_start(Connection *conn, int fd, const struct sockaddr_in *peer,
-                const Server *server, double now);
+                const AddressGroup *group, double now);
 
 // Adds the descriptors the connection is waiting on to the sets.
 void conn_watch(const Connection *conn, fd_set *reads, fd_set *writes,

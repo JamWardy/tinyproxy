@@ -230,6 +230,12 @@ static void send_to_client(Connection *conn, double now) {
 
 // ---- The request ----
 
+// $host: the request's host or, with none, the server's first name.
+static const char *host_variable(const Connection *conn) {
+    return *conn->request.host ? conn->request.host
+                               : conn->server->names[0].name;
+}
+
 // nginx's absolute_redirect: "http://", $host or else the address the
 // client reached, the port unless it's 80, then the location's path and the
 // query. Fails only when out of memory, or if the socket has no address.
@@ -239,7 +245,7 @@ static int build_redirect(const Connection *conn, const Location *location,
     struct sockaddr_in local;
     socklen_t length = sizeof(local);
     char address[INET_ADDRSTRLEN];
-    const char *host = request->host;
+    const char *host = host_variable(conn);
 
     if (getsockname(conn->client_fd, (struct sockaddr *)&local, &length) !=
         0) {
@@ -299,7 +305,7 @@ static int build_request(Connection *conn) {
              buffer_append(&forwarded, "", 1);
     if (ok) {
         Variables variables;
-        variables.host = conn->request.host;
+        variables.host = host_variable(conn);
         variables.remote_addr = conn->remote_addr;
         variables.proxy_host = location->proxy_pass.host;
         variables.proxy_add_x_forwarded_for = buffer_bytes(&forwarded);
@@ -344,6 +350,9 @@ static void connect_upstream(Connection *conn, double now) {
 }
 
 static void start_request(Connection *conn, double now) {
+    conn->server = find_server(conn->group, conn->request.host);
+    conn->settings = &conn->server->settings;
+
     Route route = find_route(conn->server, conn->request.uri);
 
     if (route.kind == ROUTE_NONE) {
@@ -640,13 +649,16 @@ static void read_reply(Connection *conn, double now) {
 // ---- The loop's side ----
 
 void conn_start(Connection *conn, int fd, const struct sockaddr_in *peer,
-                const Server *server, double now) {
+                const AddressGroup *group, double now) {
+    const Server *server = group->default_server;
+
     conn->state = CONN_READING_HEAD;
     conn->number = ++connections_accepted;
     conn->client_fd = fd;
     conn->upstream_fd = -1;
     inet_ntop(AF_INET, &peer->sin_addr, conn->remote_addr,
               sizeof(conn->remote_addr));
+    conn->group = group;
     conn->server = server;
     conn->location = NULL;
     conn->settings = &server->settings;

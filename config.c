@@ -64,7 +64,7 @@ typedef struct {
 
 typedef struct {
     const char *name;
-    const char *arguments[MAX_ARGUMENTS];
+    char *arguments[MAX_ARGUMENTS];  // In the arena.
     size_t argument_count;
     size_t line;
     int opens_block;
@@ -436,34 +436,24 @@ static int add_default_listen(Server *server) {
     listen->address.sin_port = htons(geteuid() == 0 ? 80 : 8000);
     snprintf(listen->text, sizeof(listen->text), "0.0.0.0:%d",
              geteuid() == 0 ? 80 : 8000);
+    listen->line = server->line;
     server->listens = listen;
     server->listen_count = 1;
     return 1;
 }
 
-// Several servers on one port need server_name to choose between them.
-static int check_ports_unshared(Parser *parser, const Server *server) {
-    const Config *config = parser->config;
+static int add_server_name(Server *server, ServerNameKind kind,
+                           const char *name) {
+    ServerName *names = realloc(server->names,
+                                (server->name_count + 1) * sizeof(ServerName));
 
-    for (size_t i = 0; i < config->server_count; i++) {
-        const Server *other = &config->servers[i];
-
-        if (other == server) {
-            continue;
-        }
-        for (size_t j = 0; j < other->listen_count; j++) {
-            for (size_t k = 0; k < server->listen_count; k++) {
-                unsigned short port = server->listens[k].address.sin_port;
-
-                if (other->listens[j].address.sin_port == port) {
-                    return parse_error(
-                        parser, server->line,
-                        "a second \"server\" on port %d is not supported "
-                        "until stage 3", ntohs(port));
-                }
-            }
-        }
+    if (!names) {
+        return 0;
     }
+    server->names = names;
+    server->names[server->name_count].kind = kind;
+    server->names[server->name_count].name = name;
+    server->name_count++;
     return 1;
 }
 
@@ -490,10 +480,70 @@ static int handle_server(Parser *parser, const Scope *scope,
     if (!parse_block(parser, &inner)) {
         return 0;
     }
-    if (server->listen_count == 0 && !add_default_listen(server)) {
+    // nginx's default server_name is "", which matches no Host.
+    if ((server->listen_count == 0 && !add_default_listen(server)) ||
+        (server->name_count == 0 &&
+         !add_server_name(server, NAME_EXACT, ""))) {
         return out_of_memory(parser, directive);
     }
-    return check_ports_unshared(parser, server);
+    return 1;
+}
+
+// Names are compared lowercased, as nginx's are.
+static void lowercase(char *text) {
+    for (char *c = text; *c; c++) {
+        if (*c >= 'A' && *c <= 'Z') {
+            *c = (char)(*c - 'A' + 'a');
+        }
+    }
+}
+
+// Which kind of name text is, if it's one nginx takes.
+static int classify_server_name(const char *text, ServerNameKind *kind) {
+    const char *star = strchr(text, '*');
+    size_t length = strlen(text);
+
+    if (!star) {
+        *kind = text[0] == '.' ? NAME_DOMAIN_AND_SUBDOMAINS : NAME_EXACT;
+        return text[0] != '.' || length > 1;
+    }
+    if (strchr(star + 1, '*')) {
+        return 0;
+    }
+    if (star == text && text[1] == '.' && length > 2) {
+        *kind = NAME_SUBDOMAINS;
+        return 1;
+    }
+    if (star == text + length - 1 && length > 2 && text[length - 2] == '.') {
+        *kind = NAME_PREFIX;
+        return 1;
+    }
+    return 0;
+}
+
+static int handle_server_name(Parser *parser, const Scope *scope,
+                              const Directive *directive,
+                              const DirectiveSpec *spec) {
+    (void)spec;
+    for (size_t i = 0; i < directive->argument_count; i++) {
+        char *name = directive->arguments[i];
+        ServerNameKind kind;
+
+        if (name[0] == '~') {
+            return parse_error(parser, directive->line,
+                               "regex server names are not supported");
+        }
+        lowercase(name);
+        if (!classify_server_name(name, &kind)) {
+            return parse_error(parser, directive->line,
+                               "invalid server name or wildcard \"%s\"",
+                               name);
+        }
+        if (!add_server_name(scope->server, kind, name)) {
+            return out_of_memory(parser, directive);
+        }
+    }
+    return 1;
 }
 
 static int handle_location(Parser *parser, const Scope *scope,
@@ -544,7 +594,8 @@ static int handle_location(Parser *parser, const Scope *scope,
     return parse_block(parser, &inner);
 }
 
-// "8000", "127.0.0.1:8000", "*:8000" or "localhost", as nginx's listen.
+// "8000", "127.0.0.1:8000", "*:8000" or "localhost", as nginx's listen, and
+// perhaps "default_server" after it.
 static int handle_listen(Parser *parser, const Scope *scope,
                          const Directive *directive,
                          const DirectiveSpec *spec) {
@@ -556,6 +607,15 @@ static int handle_listen(Parser *parser, const Scope *scope,
 
     (void)spec;
     memset(&listen, 0, sizeof(listen));
+    listen.line = directive->line;
+    if (directive->argument_count > 1) {
+        if (strcmp(directive->arguments[1], "default_server") != 0) {
+            return parse_error(parser, directive->line,
+                               "invalid parameter \"%s\"",
+                               directive->arguments[1]);
+        }
+        listen.default_server = 1;
+    }
     if (strlen(text) >= sizeof(host)) {
         return invalid_value(parser, directive);
     }
@@ -763,7 +823,9 @@ static int handle_size(Parser *parser, const Scope *scope,
 static const DirectiveSpec DIRECTIVES[] = {
     {"http", CONTEXT_MAIN, 1, 0, 0, handle_http, 0},
     {"server", CONTEXT_HTTP, 1, 0, 0, handle_server, 0},
-    {"listen", CONTEXT_SERVER, 0, 1, 1, handle_listen, 0},
+    {"listen", CONTEXT_SERVER, 0, 1, 2, handle_listen, 0},
+    {"server_name", CONTEXT_SERVER, 0, 1, MAX_ARGUMENTS, handle_server_name,
+     0},
     {"location", CONTEXT_SERVER | CONTEXT_LOCATION, 1, 1, 2, handle_location,
      0},
     {"proxy_pass", CONTEXT_LOCATION, 0, 1, 1, handle_proxy_pass, 0},
@@ -1001,6 +1063,125 @@ static int inherit_all(Config *config) {
     return 1;
 }
 
+// ---- Grouping by address and port ----
+
+static ListenPort *find_or_add_port(Config *config, unsigned short number) {
+    for (size_t i = 0; i < config->port_count; i++) {
+        if (config->ports[i].port == number) {
+            return &config->ports[i];
+        }
+    }
+    ListenPort *ports = realloc(config->ports,
+                                (config->port_count + 1) * sizeof(ListenPort));
+    if (!ports) {
+        return NULL;
+    }
+    config->ports = ports;
+    ListenPort *port = &ports[config->port_count++];
+    port->port = number;
+    port->groups = NULL;
+    port->group_count = 0;
+    return port;
+}
+
+static AddressGroup *find_or_add_group(ListenPort *port,
+                                       const Listen *listen) {
+    for (size_t i = 0; i < port->group_count; i++) {
+        if (port->groups[i].address.sin_addr.s_addr ==
+            listen->address.sin_addr.s_addr) {
+            return &port->groups[i];
+        }
+    }
+    AddressGroup *groups = realloc(
+        port->groups, (port->group_count + 1) * sizeof(AddressGroup));
+    if (!groups) {
+        return NULL;
+    }
+    port->groups = groups;
+    AddressGroup *group = &groups[port->group_count++];
+    memset(group, 0, sizeof(*group));
+    group->address = listen->address;
+    memcpy(group->text, listen->text, sizeof(group->text));
+    return group;
+}
+
+// The group's servers so far came first, so they keep a name both have.
+static void warn_name_conflicts(const AddressGroup *group,
+                                const Server *server) {
+    for (size_t i = 0; i < server->name_count; i++) {
+        const char *name = server->names[i].name;
+        int clash = 0;
+
+        for (size_t j = 0; j < group->server_count && !clash; j++) {
+            const Server *earlier = group->servers[j];
+
+            for (size_t k = 0; k < earlier->name_count && !clash; k++) {
+                clash = strcmp(earlier->names[k].name, name) == 0;
+            }
+        }
+        if (clash) {
+            fprintf(stderr, "tinyproxy: [warn] conflicting server name "
+                            "\"%s\" on %s, ignored\n", name, group->text);
+        }
+    }
+}
+
+static int add_to_group(Parser *parser, const Server *server,
+                        const Listen *listen) {
+    Config *config = parser->config;
+    ListenPort *port = find_or_add_port(config,
+                                        ntohs(listen->address.sin_port));
+    AddressGroup *group = port ? find_or_add_group(port, listen) : NULL;
+
+    if (!group) {
+        return parse_error(parser, listen->line, "out of memory");
+    }
+    if (listen->default_server) {
+        if (group->default_server) {
+            return parse_error(parser, listen->line,
+                               "a duplicate default server for %s",
+                               group->text);
+        }
+        group->default_server = server;
+    }
+    warn_name_conflicts(group, server);
+
+    const Server **servers = realloc(
+        group->servers, (group->server_count + 1) * sizeof(Server *));
+    if (!servers) {
+        return parse_error(parser, listen->line, "out of memory");
+    }
+    group->servers = servers;
+    group->servers[group->server_count++] = server;
+    return 1;
+}
+
+// Done once every server is read, as config->servers moves while it grows.
+static int group_servers(Parser *parser) {
+    Config *config = parser->config;
+
+    for (size_t i = 0; i < config->server_count; i++) {
+        const Server *server = &config->servers[i];
+
+        for (size_t j = 0; j < server->listen_count; j++) {
+            if (!add_to_group(parser, server, &server->listens[j])) {
+                return 0;
+            }
+        }
+    }
+    // With none marked default_server, a group's first server is.
+    for (size_t i = 0; i < config->port_count; i++) {
+        for (size_t j = 0; j < config->ports[i].group_count; j++) {
+            AddressGroup *group = &config->ports[i].groups[j];
+
+            if (!group->default_server) {
+                group->default_server = group->servers[0];
+            }
+        }
+    }
+    return 1;
+}
+
 // ---- Loading ----
 
 static char *read_file(const char *path, size_t *length) {
@@ -1075,7 +1256,7 @@ int config_load(Config *config, const char *path, char *error,
     parser.error_size = error_size;
 
     Scope top = {CONTEXT_MAIN, NULL, NULL, NULL};
-    int ok = parse_block(&parser, &top);
+    int ok = parse_block(&parser, &top) && group_servers(&parser);
     free(text);
     if (ok && !inherit_all(config)) {
         snprintf(error, error_size, "out of memory");
@@ -1092,6 +1273,13 @@ static void block_settings_free(BlockSettings *settings) {
 }
 
 void config_free(Config *config) {
+    for (size_t i = 0; i < config->port_count; i++) {
+        for (size_t j = 0; j < config->ports[i].group_count; j++) {
+            free(config->ports[i].groups[j].servers);
+        }
+        free(config->ports[i].groups);
+    }
+    free(config->ports);
     for (size_t i = 0; i < config->server_count; i++) {
         Server *server = &config->servers[i];
 
@@ -1102,6 +1290,7 @@ void config_free(Config *config) {
         }
         free(server->locations);
         free(server->listens);
+        free(server->names);
         block_settings_free(&server->written);
     }
     free(config->servers);

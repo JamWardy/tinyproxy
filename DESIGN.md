@@ -62,10 +62,7 @@ An unknown directive, or one in the wrong block, stops it starting,
 with the file and line, as nginx's `[emerg]` does. Each stage below
 adds its own directives.
 
-Until a stage adds them, it refuses what that stage brings in the same
-way: a second `server` on the same port before stage 3. Several
-`server`s on different ports are fine from stage 1. A request that
-matches no `location` gets `404`.
+A request that matches no `location` gets `404`.
 
 ## The request
 
@@ -185,7 +182,25 @@ Each stage adds nginx's directives for it.
      unless it's 80, and the path.
 3. **Host routing:** several `server`s on one port. `server_name`
    picks one by the `Host` header; with no match, the one marked
-   `default_server` on its `listen`, or else the first.
+   `default_server` on its `listen`, or else the first. As in nginx:
+   - Servers are grouped by the address and port they listen on. If
+     any server on a port listens on every address (`listen 8000`),
+     tinyproxy opens one socket for the port, and each connection uses
+     the group for the address it arrived on, or else the every-address
+     one. Otherwise each address gets its own socket. Only the group's
+     servers are candidates, and its default is its own.
+   - Names are matched ignoring case, in nginx's order: an exact name;
+     then the longest leading wildcard, `*.shop.local` (any name ending
+     `.shop.local`) or `.shop.local` (that, or `shop.local` itself);
+     then the longest trailing wildcard, `mail.*`. A `*` anywhere else,
+     or a regex name (`~`), stops it starting.
+   - A server with no `server_name` has the empty name `""`, which
+     matches a request with no `Host`, as does `server_name ""`.
+   - Two servers in a group with the same name get nginx's `[warn]
+     conflicting server name "x" on 0.0.0.0:8000, ignored` at startup,
+     and the first keeps it. Two `default_server`s in a group stop it
+     starting.
+   - With no `Host`, `$host` is the server's first name.
 4. **Upstream pools:** `upstream name { server host:port; ... }`, and
    `proxy_pass http://name;`.
 5. **Keep-alive:** as nginx's, `proxy_http_version 1.1`,
@@ -223,7 +238,7 @@ Stages 9 and 10 are the gateway's.
 
 - No chunked request bodies; nginx accepts them. One gets `411`, as
   nginx's did before it did.
-- No regex `location`s (`~`) and no wildcard `server_name`s.
+- No regex `location`s or `server_name`s (`~`).
 - No `location` inside another; nginx allows them. One stops it
   starting.
 - One `access_log` per block; nginx can write to several.

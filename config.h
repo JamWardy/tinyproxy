@@ -88,12 +88,29 @@ typedef struct {
 } Location;
 
 typedef struct {
-    struct sockaddr_in address;
-    char text[32];  // "0.0.0.0:8000", for messages.
+    struct sockaddr_in address;  // INADDR_ANY for every address.
+    char text[32];               // "0.0.0.0:8000", for messages.
+    int default_server;
+    size_t line;
 } Listen;
+
+typedef enum {
+    NAME_EXACT,                  // "shop.local", or "" for no Host.
+    NAME_SUBDOMAINS,             // "*.shop.local": any name ending in
+                                 // ".shop.local".
+    NAME_DOMAIN_AND_SUBDOMAINS,  // ".shop.local": that, or "shop.local".
+    NAME_PREFIX,                 // "mail.*": any name starting "mail.".
+} ServerNameKind;
+
+typedef struct {
+    ServerNameKind kind;
+    const char *name;  // As written, lowercased.
+} ServerName;
 
 typedef struct {
     size_t line;  // Where its block starts, for messages.
+    ServerName *names;  // At least one: "" if it has no server_name.
+    size_t name_count;
     Listen *listens;
     size_t listen_count;
     Location *locations;
@@ -102,12 +119,30 @@ typedef struct {
     Settings settings;
 } Server;
 
+// The servers that listen on one address and port, nginx's
+// ngx_http_conf_addr_t. The servers are borrowed from Config.servers.
+typedef struct {
+    struct sockaddr_in address;  // INADDR_ANY for every address.
+    char text[32];
+    const Server *default_server;
+    const Server **servers;  // In the config's order, so the first wins.
+    size_t server_count;
+} AddressGroup;
+
+typedef struct {
+    unsigned short port;
+    AddressGroup *groups;
+    size_t group_count;
+} ListenPort;
+
 typedef struct {
     char *arena;  // Every string in the config points into it.
     BlockSettings http;
     int has_http;
     Server *servers;
     size_t server_count;
+    ListenPort *ports;  // Built from the servers' listens once they're read.
+    size_t port_count;
 } Config;
 
 // On failure, error says why, with the file and line, and config_free must

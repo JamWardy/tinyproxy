@@ -14,7 +14,7 @@ tinyproxy/
                   back
   chunked.c/.h    decoding a chunked reply
   uri.c/.h        normalising the path, and escaping it again
-  route.c/.h      choosing the location
+  route.c/.h      choosing the server and the location
   variables.c/.h  $host and the others, for proxy_set_header
   error_page.c/.h tinyproxy's own replies and nginx's pages
   http.c/.h       what those share: header types, versions, line helpers
@@ -54,7 +54,20 @@ tinyproxy/
         `/search/../orders`, `%2e%2e`, a path in `proxy_pass` with a
         query, no match (`404`), the `301`, a duplicate location, then
         the shop's routes with `curl` to each service
-- [ ] 3: host routing, `server_name` and `default_server`
+- [x] 3: host routing, as in `DESIGN.md`:
+  - [x] `server_name`: exact names, `""` and wildcards, with regex
+        names refused
+  - [x] `default_server` on `listen`, and two in a group refused
+  - [x] Servers grouped by address and port, with one socket on every
+        address when a server on the port asks for it, and the group
+        picked by the address a connection arrived on
+  - [x] Choosing the server by `Host`, and `$host` from its first name
+        when there's no `Host`
+  - [x] The `[warn]` for conflicting names
+  - [x] Try it by hand: two names on one port, `*.` and `.` and `.*`
+        wildcards and which wins, no `Host` with and without a `""`
+        server, `default_server`, a specific address beside the
+        every-address one, and each config error
 - [ ] 4: `upstream` blocks
 - [ ] 5: keep-alive, `keepalive` in `upstream` blocks and
       `keepalive_timeout`, once tinyhttp has it
