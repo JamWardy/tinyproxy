@@ -4,7 +4,7 @@ CC ?= cc
 CFLAGS = -std=c99 -Wall -Wextra -Wpedantic -g -D_DEFAULT_SOURCE
 
 SRCS = main.c config.c loop.c conn.c request.c proxy.c chunked.c uri.c \
-       route.c variables.c error_page.c http.c buffer.c log.c
+       route.c upstream.c variables.c error_page.c http.c buffer.c log.c
 
 # Objects and .d files go in build/.
 OBJS = $(SRCS:%.c=build/%.o)

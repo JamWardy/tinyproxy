@@ -107,17 +107,18 @@ static void log_conn_error(const Connection *conn, const char *format, ...) {
     vsnprintf(message, sizeof(message), format, args);
     va_end(args);
 
+    // As nginx's, there's an upstream only once a server's been chosen.
+    char upstream[1024] = "";
+    if (conn->peer) {
+        snprintf(upstream, sizeof(upstream), ", upstream: \"http://%s%s\"",
+                 conn->peer->text, buffer_bytes(&conn->upstream_uri));
+    }
+
     const Request *request = &conn->request;
-    const Location *location = conn->location;
     error_log("error",
-              "*%llu %s, client: %s, request: \"%s\", upstream: "
-              "\"%s%s\", host: \"%s\"",
+              "*%llu %s, client: %s, request: \"%s\"%s, host: \"%s\"",
               conn->number, message, conn->remote_addr,
-              request->line ? request->line : "",
-              location && location->has_proxy_pass
-                  ? location->proxy_pass.origin
-                  : "",
-              buffer_bytes(&conn->upstream_uri),
+              request->line ? request->line : "", upstream,
               request->host ? request->host : "");
 }
 
@@ -341,7 +342,8 @@ static void connect_upstream(Connection *conn, double now) {
     conn->upstream_fd = fd;
     conn->upstream_io_at = now;
     enter(conn, CONN_CONNECTING);
-    const struct sockaddr_in *address = &conn->location->proxy_pass.address;
+    conn->peer = choose_peer(conn->location->proxy_pass.upstream);
+    const struct sockaddr_in *address = &conn->peer->address;
     if (connect(fd, (const struct sockaddr *)address, sizeof(*address)) == 0) {
         enter(conn, CONN_SENDING_REQUEST);
     } else if (errno != EINPROGRESS) {
@@ -661,6 +663,7 @@ void conn_start(Connection *conn, int fd, const struct sockaddr_in *peer,
     conn->group = group;
     conn->server = server;
     conn->location = NULL;
+    conn->peer = NULL;
     conn->settings = &server->settings;
     buffer_init(&conn->from_client);
     conn->head_length = 0;

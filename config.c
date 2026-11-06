@@ -33,6 +33,7 @@ typedef enum {
     CONTEXT_HTTP = 2,
     CONTEXT_SERVER = 4,
     CONTEXT_LOCATION = 8,
+    CONTEXT_UPSTREAM = 16,
 } Context;
 
 #define ANY_HTTP_BLOCK (CONTEXT_HTTP | CONTEXT_SERVER | CONTEXT_LOCATION)
@@ -70,12 +71,14 @@ typedef struct {
     int opens_block;
 } Directive;
 
-// The block being read. server and location are NULL outside them.
+// The block being read. server, location and upstream are NULL outside
+// them, and settings in an upstream.
 typedef struct {
     Context context;
     Server *server;
     Location *location;
     BlockSettings *settings;
+    Upstream *upstream;
 } Scope;
 
 static int parse_error(Parser *parser, size_t line, const char *format, ...)
@@ -406,7 +409,7 @@ static int handle_http(Parser *parser, const Scope *scope,
                        const Directive *directive,
                        const DirectiveSpec *spec) {
     Config *config = parser->config;
-    Scope inner = {CONTEXT_HTTP, NULL, NULL, &config->http};
+    Scope inner = {CONTEXT_HTTP, NULL, NULL, &config->http, NULL};
 
     (void)scope;
     (void)spec;
@@ -476,7 +479,7 @@ static int handle_server(Parser *parser, const Scope *scope,
     server->line = directive->line;
     block_settings_init(&server->written);
 
-    Scope inner = {CONTEXT_SERVER, server, NULL, &server->written};
+    Scope inner = {CONTEXT_SERVER, server, NULL, &server->written, NULL};
     if (!parse_block(parser, &inner)) {
         return 0;
     }
@@ -590,7 +593,8 @@ static int handle_location(Parser *parser, const Scope *scope,
     location->path = path;
     block_settings_init(&location->written);
 
-    Scope inner = {CONTEXT_LOCATION, server, location, &location->written};
+    Scope inner = {CONTEXT_LOCATION, server, location, &location->written,
+                   NULL};
     return parse_block(parser, &inner);
 }
 
@@ -656,7 +660,18 @@ static int handle_listen(Parser *parser, const Scope *scope,
     return 1;
 }
 
-// "http://host:port", and perhaps a path after it.
+static char *copy_text(const char *text, size_t length) {
+    char *copy = malloc(length + 1);
+
+    if (copy) {
+        memcpy(copy, text, length);
+        copy[length] = '\0';
+    }
+    return copy;
+}
+
+// "http://" and a pool's name or a host and port, and perhaps a path after
+// it. Which it is waits until the whole file is read.
 static int handle_proxy_pass(Parser *parser, const Scope *scope,
                              const Directive *directive,
                              const DirectiveSpec *spec) {
@@ -673,34 +688,210 @@ static int handle_proxy_pass(Parser *parser, const Scope *scope,
         return parse_error(parser, directive->line,
                            "invalid URL prefix in \"%s\"", url);
     }
-    const char *uri = strchr(url + 7, '/');
-    size_t origin_length = uri ? (size_t)(uri - url) : strlen(url);
-    char *origin = malloc(origin_length + 1);
-    if (!origin) {
+    const char *authority = url + 7;
+    const char *uri = strchr(authority, '/');
+    size_t length = uri ? (size_t)(uri - authority) : strlen(authority);
+    if (length >= sizeof(host)) {
+        return invalid_value(parser, directive);
+    }
+    // Owned by the location from here, so freed with it even on failure.
+    location->proxy_pass.host = copy_text(authority, length);
+    if (!location->proxy_pass.host) {
         return out_of_memory(parser, directive);
     }
-    memcpy(origin, url, origin_length);
-    origin[origin_length] = '\0';
-    // Owned by the location from here, so freed with it even on failure.
-    location->proxy_pass.origin = origin;
-
-    const char *authority = origin + 7;
-    if (strlen(authority) >= sizeof(host) ||
-        !split_host_port(authority, host, &port)) {
+    if (!split_host_port(location->proxy_pass.host, host, &port)) {
         return parse_error(parser, directive->line,
-                           "invalid port in upstream \"%s\"", authority);
+                           "invalid port in upstream \"%s\"",
+                           location->proxy_pass.host);
     }
     if (host[0] == '\0') {
         return parse_error(parser, directive->line, "no host in upstream "
                                                     "\"%s\"", url);
     }
-    if (!resolve(host, port, &location->proxy_pass.address)) {
-        return parse_error(parser, directive->line,
-                           "host not found in upstream \"%s\"", authority);
-    }
-    location->proxy_pass.host = authority;
     location->proxy_pass.uri = uri;
+    location->proxy_pass.line = directive->line;
     location->has_proxy_pass = 1;
+    return 1;
+}
+
+// ---- Upstream pools ----
+
+// Fails only when out of memory.
+static Upstream *add_upstream(Config *config, UpstreamKind kind,
+                              const char *name, size_t line) {
+    Upstream **upstreams = realloc(
+        config->upstreams, (config->upstream_count + 1) * sizeof(Upstream *));
+    if (!upstreams) {
+        return NULL;
+    }
+    config->upstreams = upstreams;
+
+    Upstream *upstream = malloc(sizeof(Upstream));
+    char *copy = copy_text(name, strlen(name));
+    if (!upstream || !copy) {
+        free(upstream);
+        free(copy);
+        return NULL;
+    }
+    upstream->kind = kind;
+    upstream->name = copy;
+    upstream->line = line;
+    upstream->peers = NULL;
+    upstream->peer_count = 0;
+    config->upstreams[config->upstream_count++] = upstream;
+    return upstream;
+}
+
+// Names match ignoring case, as nginx's do.
+static Upstream *find_upstream(const Config *config, UpstreamKind kind,
+                               const char *name) {
+    for (size_t i = 0; i < config->upstream_count; i++) {
+        Upstream *upstream = config->upstreams[i];
+
+        if (upstream->kind == kind && strcasecmp(upstream->name, name) == 0) {
+            return upstream;
+        }
+    }
+    return NULL;
+}
+
+static int handle_upstream(Parser *parser, const Scope *scope,
+                           const Directive *directive,
+                           const DirectiveSpec *spec) {
+    Config *config = parser->config;
+    const char *name = directive->arguments[0];
+
+    (void)scope;
+    (void)spec;
+    if (find_upstream(config, UPSTREAM_BLOCK, name)) {
+        return parse_error(parser, directive->line,
+                           "duplicate upstream \"%s\"", name);
+    }
+    Upstream *upstream = add_upstream(config, UPSTREAM_BLOCK, name,
+                                      directive->line);
+    if (!upstream) {
+        return out_of_memory(parser, directive);
+    }
+
+    Scope inner = {CONTEXT_UPSTREAM, NULL, NULL, NULL, upstream};
+    if (!parse_block(parser, &inner)) {
+        return 0;
+    }
+    if (upstream->peer_count == 0) {
+        return parse_error(parser, directive->line,
+                           "no servers are inside upstream");
+    }
+    return 1;
+}
+
+// A server option, none of which this stage has.
+static int check_server_option(Parser *parser, const Directive *directive,
+                               const char *option) {
+    if (strncmp(option, "weight=", 7) == 0) {
+        return parse_error(parser, directive->line,
+                           "\"weight\" is not supported until stage 6");
+    }
+    if (strncmp(option, "max_fails=", 10) == 0 ||
+        strncmp(option, "fail_timeout=", 13) == 0) {
+        return parse_error(parser, directive->line,
+                           "\"%.*s\" is not supported until stage 7",
+                           (int)strcspn(option, "="), option);
+    }
+    return parse_error(parser, directive->line, "invalid parameter \"%s\"",
+                       option);
+}
+
+// "server host:port;" in an upstream block.
+static int handle_upstream_server(Parser *parser, const Scope *scope,
+                                  const Directive *directive,
+                                  const DirectiveSpec *spec) {
+    const char *address = directive->arguments[0];
+    char host[256];
+    unsigned short port = 80;
+
+    (void)spec;
+    for (size_t i = 1; i < directive->argument_count; i++) {
+        if (!check_server_option(parser, directive,
+                                 directive->arguments[i])) {
+            return 0;
+        }
+    }
+    if (strlen(address) >= sizeof(host) ||
+        !split_host_port(address, host, &port)) {
+        return parse_error(parser, directive->line,
+                           "invalid port in upstream \"%s\"", address);
+    }
+    switch (upstream_add_peers(scope->upstream, host, port)) {
+        case PEERS_ADDED:
+            return 1;
+        case PEERS_NOT_FOUND:
+            return parse_error(parser, directive->line,
+                               "host not found in upstream \"%s\"",
+                               address);
+        case PEERS_OUT_OF_MEMORY:
+            return out_of_memory(parser, directive);
+    }
+    return 0;
+}
+
+// Points a proxy_pass at its pool: the upstream block of that name, or an
+// unnamed one for the host and port, shared by every proxy_pass to them.
+static int link_proxy_pass(Parser *parser, ProxyPass *pass) {
+    Config *config = parser->config;
+    char host[256];
+    unsigned short port = 80;
+
+    // handle_proxy_pass checked it splits.
+    split_host_port(pass->host, host, &port);
+    Upstream *upstream = find_upstream(config, UPSTREAM_BLOCK, host);
+    if (upstream) {
+        if (strchr(pass->host, ':')) {
+            return parse_error(parser, pass->line,
+                               "upstream \"%s\" may not have port %d",
+                               host, port);
+        }
+        pass->upstream = upstream;
+        return 1;
+    }
+
+    upstream = find_upstream(config, UPSTREAM_IMPLICIT, pass->host);
+    if (!upstream) {
+        upstream = add_upstream(config, UPSTREAM_IMPLICIT, pass->host,
+                                pass->line);
+        if (!upstream) {
+            return parse_error(parser, pass->line, "out of memory");
+        }
+        switch (upstream_add_peers(upstream, host, port)) {
+            case PEERS_ADDED:
+                break;
+            case PEERS_NOT_FOUND:
+                return parse_error(parser, pass->line,
+                                   "host not found in upstream \"%s\"",
+                                   pass->host);
+            case PEERS_OUT_OF_MEMORY:
+                return parse_error(parser, pass->line, "out of memory");
+        }
+    }
+    pass->upstream = upstream;
+    return 1;
+}
+
+// Done once the whole file is read, as an upstream can come after its use.
+static int link_proxy_passes(Parser *parser) {
+    Config *config = parser->config;
+
+    for (size_t i = 0; i < config->server_count; i++) {
+        Server *server = &config->servers[i];
+
+        for (size_t j = 0; j < server->location_count; j++) {
+            Location *location = &server->locations[j];
+
+            if (location->has_proxy_pass &&
+                !link_proxy_pass(parser, &location->proxy_pass)) {
+                return 0;
+            }
+        }
+    }
     return 1;
 }
 
@@ -823,6 +1014,9 @@ static int handle_size(Parser *parser, const Scope *scope,
 static const DirectiveSpec DIRECTIVES[] = {
     {"http", CONTEXT_MAIN, 1, 0, 0, handle_http, 0},
     {"server", CONTEXT_HTTP, 1, 0, 0, handle_server, 0},
+    {"upstream", CONTEXT_HTTP, 1, 1, 1, handle_upstream, 0},
+    {"server", CONTEXT_UPSTREAM, 0, 1, MAX_ARGUMENTS, handle_upstream_server,
+     0},
     {"listen", CONTEXT_SERVER, 0, 1, 2, handle_listen, 0},
     {"server_name", CONTEXT_SERVER, 0, 1, MAX_ARGUMENTS, handle_server_name,
      0},
@@ -842,18 +1036,28 @@ static const DirectiveSpec DIRECTIVES[] = {
     SECONDS(send_timeout, ANY_HTTP_BLOCK),
 };
 
-static const DirectiveSpec *find_directive(const char *name) {
+// The spec for name in context, or else any for name, for the "not allowed
+// here" error. "server" has one in http and another in upstream.
+static const DirectiveSpec *find_directive(const char *name,
+                                           Context context) {
+    const DirectiveSpec *any = NULL;
+
     for (size_t i = 0; i < sizeof(DIRECTIVES) / sizeof(DIRECTIVES[0]); i++) {
-        if (strcmp(DIRECTIVES[i].name, name) == 0) {
+        if (strcmp(DIRECTIVES[i].name, name) != 0) {
+            continue;
+        }
+        if (DIRECTIVES[i].contexts & (int)context) {
             return &DIRECTIVES[i];
         }
+        any = &DIRECTIVES[i];
     }
-    return NULL;
+    return any;
 }
 
 static int run_directive(Parser *parser, const Scope *scope,
                          const Directive *directive) {
-    const DirectiveSpec *spec = find_directive(directive->name);
+    const DirectiveSpec *spec = find_directive(directive->name,
+                                               scope->context);
     const char *name = directive->name;
     size_t line = directive->line;
 
@@ -1255,8 +1459,9 @@ int config_load(Config *config, const char *path, char *error,
     parser.error = error;
     parser.error_size = error_size;
 
-    Scope top = {CONTEXT_MAIN, NULL, NULL, NULL};
-    int ok = parse_block(&parser, &top) && group_servers(&parser);
+    Scope top = {CONTEXT_MAIN, NULL, NULL, NULL, NULL};
+    int ok = parse_block(&parser, &top) && link_proxy_passes(&parser) &&
+             group_servers(&parser);
     free(text);
     if (ok && !inherit_all(config)) {
         snprintf(error, error_size, "out of memory");
@@ -1280,11 +1485,15 @@ void config_free(Config *config) {
         free(config->ports[i].groups);
     }
     free(config->ports);
+    for (size_t i = 0; i < config->upstream_count; i++) {
+        upstream_free(config->upstreams[i]);
+    }
+    free(config->upstreams);
     for (size_t i = 0; i < config->server_count; i++) {
         Server *server = &config->servers[i];
 
         for (size_t j = 0; j < server->location_count; j++) {
-            free(server->locations[j].proxy_pass.origin);
+            free(server->locations[j].proxy_pass.host);
             free(server->locations[j].proxy_headers.items);
             block_settings_free(&server->locations[j].written);
         }

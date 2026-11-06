@@ -202,7 +202,25 @@ Each stage adds nginx's directives for it.
      starting.
    - With no `Host`, `$host` is the server's first name.
 4. **Upstream pools:** `upstream name { server host:port; ... }`, and
-   `proxy_pass http://name;`.
+   `proxy_pass http://name;`. As in nginx:
+   - `proxy_pass` always sends to a pool. `http://127.0.0.1:8003` is
+     an unnamed one with that one server, shared by every `proxy_pass`
+     that names it. A name is looked up once the whole file is read,
+     so an `upstream` can come after the `proxy_pass` that uses it,
+     and names are matched ignoring case. `$proxy_host` is what's
+     written after `http://` in `proxy_pass`, up to any path: the
+     pool's name, or the host and port.
+   - A host name that resolves to several addresses is one server per
+     address, in a pool's `server` or in `proxy_pass`.
+   - Until stage 6 balances between them, every request goes to the
+     pool's first server.
+   - These stop it starting: two pools with one name (`duplicate
+     upstream "x"`), a pool with no servers, a port after a pool's
+     name in `proxy_pass` (`upstream "x" may not have port 8080`), and
+     a `server` option other than the ones later stages add, which
+     say which stage until then.
+   - The error log's `upstream:` is the server's own address, such as
+     `http://127.0.0.1:8003/search`.
 5. **Keep-alive:** as nginx's, `proxy_http_version 1.1`,
    `proxy_set_header Connection ""` and `keepalive N;` in an
    `upstream` block keep up to N idle connections to its servers open

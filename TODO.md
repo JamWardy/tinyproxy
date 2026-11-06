@@ -15,6 +15,7 @@ tinyproxy/
   chunked.c/.h    decoding a chunked reply
   uri.c/.h        normalising the path, and escaping it again
   route.c/.h      choosing the server and the location
+  upstream.c/.h   upstream pools and choosing a server from one
   variables.c/.h  $host and the others, for proxy_set_header
   error_page.c/.h tinyproxy's own replies and nginx's pages
   http.c/.h       what those share: header types, versions, line helpers
@@ -68,7 +69,17 @@ tinyproxy/
         wildcards and which wins, no `Host` with and without a `""`
         server, `default_server`, a specific address beside the
         every-address one, and each config error
-- [ ] 4: `upstream` blocks
+- [x] 4: upstream pools, as in `DESIGN.md`:
+  - [x] `upstream` blocks and their `server`s, with their errors, in
+        `upstream.c`
+  - [x] Every `proxy_pass` to a pool, named or not, looked up once the
+        file is read
+  - [x] A host name's every address as a server
+  - [x] Choosing the server, the pool's first until stage 6
+  - [x] The server's address in the error log
+  - [x] Try it by hand: a pool and a plain address side by side, an
+        `upstream` after its use, each config error, a pool whose
+        server is down (`502`), and the shop through pools
 - [ ] 5: keep-alive, `keepalive` in `upstream` blocks and
       `keepalive_timeout`, once tinyhttp has it
 - [ ] 6: round robin with `weight=`, and `least_conn`

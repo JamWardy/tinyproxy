@@ -46,6 +46,7 @@ typedef struct {
     const AddressGroup *group;
     const Server *server;
     const Location *location;  // NULL until then.
+    const Peer *peer;          // The server it's sent to; NULL until chosen.
     const Settings *settings;
 
     Buffer from_client;  // The request's head, then its body.

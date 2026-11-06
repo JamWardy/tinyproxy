@@ -5,6 +5,7 @@
 #include <stddef.h>
 
 #include "http.h"
+#include "upstream.h"
 
 typedef struct {
     int is_set;
@@ -64,10 +65,11 @@ typedef struct {
 } Settings;
 
 typedef struct {
-    char *origin;      // "http://host:port" as written, without the path.
-    const char *host;  // $proxy_host: the host and port, inside origin.
-    const char *uri;   // The path written after them, or NULL.
-    struct sockaddr_in address;
+    char *host;       // $proxy_host: as written after "http://", up to any
+                      // path, so a pool's name or a host and port.
+    const char *uri;  // The path written after it, or NULL.
+    size_t line;
+    const Upstream *upstream;  // Looked up once the whole file is read.
 } ProxyPass;
 
 typedef enum {
@@ -143,6 +145,9 @@ typedef struct {
     size_t server_count;
     ListenPort *ports;  // Built from the servers' listens once they're read.
     size_t port_count;
+    // Each on the heap, so a proxy_pass's pointer lasts as more are added.
+    Upstream **upstreams;
+    size_t upstream_count;
 } Config;
 
 // On failure, error says why, with the file and line, and config_free must
