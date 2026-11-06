@@ -226,7 +226,7 @@ Each stage adds nginx's directives for it.
    `upstream` block keep up to N idle connections to its servers open
    for the next request, and `keepalive_timeout` (75 s) keeps a
    client's open for its next one. It needs tinyhttp's keep-alive, in
-   `../tinyhttp/TODO.md`.
+   `../tinyhttp/DESIGN.md`.
 6. **Load balancing:** round robin by default, with `weight=` on a
    `server`; `least_conn;` picks the one with the fewest open
    connections.
