@@ -224,9 +224,11 @@ Each stage adds nginx's directives for it.
 5. **Keep-alive:** as nginx's, `proxy_http_version 1.1`,
    `proxy_set_header Connection ""` and `keepalive N;` in an
    `upstream` block keep up to N idle connections to its servers open
-   for the next request, and `keepalive_timeout` (75 s) keeps a
-   client's open for its next one. It needs tinyhttp's keep-alive, in
-   `../tinyhttp/DESIGN.md`.
+   for the next request, each for up to `keepalive_timeout` (60 s) in
+   the `upstream` block, and `keepalive_timeout` (75 s) in `http` or
+   `server` keeps a client's open for its next one. It needs tinyhttp's
+   keep-alive, in `../tinyhttp/DESIGN.md`, whose idle time in the shop
+   is longer, so tinyproxy always closes an idle connection first.
 6. **Load balancing:** round robin by default, with `weight=` on a
    `server`; `least_conn;` picks the one with the fewest open
    connections.
