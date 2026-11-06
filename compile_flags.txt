@@ -1,0 +1,2 @@
+-std=c99
+-D_DEFAULT_SOURCE

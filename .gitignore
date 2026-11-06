@@ -1,0 +1,4 @@
+# Build outputs
+/tinyproxy
+/build/
+*.dSYM/
