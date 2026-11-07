@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "conn.h"
+#include "keepalive.h"
 #include "log.h"
 
 #define LISTEN_BACKLOG 511  // nginx's default on Linux.
@@ -162,6 +163,27 @@ static Connection *free_slot(Connection *connections) {
     return NULL;
 }
 
+// With none free, as nginx: closes the connection that has waited longest
+// for its next request, and takes its slot.
+static Connection *reuse_idle(Connection *connections) {
+    Connection *oldest = NULL;
+
+    for (size_t i = 0; i < MAX_CONNECTIONS; i++) {
+        Connection *conn = &connections[i];
+
+        if (conn->state == CONN_KEEPALIVE &&
+            (!oldest || conn->client_io_at < oldest->client_io_at)) {
+            oldest = conn;
+        }
+    }
+    if (oldest) {
+        error_log("warn", "%d worker_connections are not enough, reusing "
+                          "connections", MAX_CONNECTIONS);
+        conn_close(oldest);
+    }
+    return oldest;
+}
+
 // Several clients may be waiting in the backlog, so accepts until none are.
 static void accept_connections(const Listener *listener,
                                Connection *connections, double now) {
@@ -174,6 +196,9 @@ static void accept_connections(const Listener *listener,
             return;  // EAGAIN: no more for now; anything else, try later.
         }
         Connection *conn = free_slot(connections);
+        if (!conn && fd < FD_SETSIZE) {
+            conn = reuse_idle(connections);
+        }
         if (!conn || fd >= FD_SETSIZE) {
             error_log("alert", "%d worker_connections are not enough",
                       MAX_CONNECTIONS);
@@ -191,11 +216,12 @@ static void accept_connections(const Listener *listener,
     }
 }
 
-// Until the nearest connection's deadline, or no limit if none has one.
+// Until the nearest deadline, a connection's or an idle upstream one's, or
+// no limit if none has one.
 static struct timespec *select_timeout(const Connection *connections,
                                        struct timespec *timeout) {
-    int has_deadline = 0;
     double nearest = 0;
+    int has_deadline = keepalive_deadline(&nearest);
 
     for (size_t i = 0; i < MAX_CONNECTIONS; i++) {
         double at;
@@ -256,6 +282,7 @@ static int watch(const Listeners *listeners, const Connection *connections,
     for (size_t i = 0; i < MAX_CONNECTIONS; i++) {
         conn_watch(&connections[i], reads, writes, &highest);
     }
+    keepalive_watch(reads, &highest);
     return highest;
 }
 
@@ -263,6 +290,8 @@ static void handle_ready(const Listeners *listeners, Connection *connections,
                          const fd_set *reads, const fd_set *writes) {
     double now = now_seconds();
 
+    // First, so a connection can't take an idle one that has just closed.
+    keepalive_handle_ready(reads);
     for (size_t i = 0; i < listeners->count; i++) {
         if (FD_ISSET(listeners->items[i].fd, reads)) {
             accept_connections(&listeners->items[i], connections, now);
@@ -276,6 +305,7 @@ static void handle_ready(const Listeners *listeners, Connection *connections,
     for (size_t i = 0; i < MAX_CONNECTIONS; i++) {
         conn_expire(&connections[i], now);
     }
+    keepalive_expire(now);
 }
 
 int loop_run(const Config *config) {
@@ -291,6 +321,12 @@ int loop_run(const Config *config) {
         return 1;
     }
     if (!open_listeners(config, &listeners)) {
+        return 1;
+    }
+    if (!keepalive_init(config)) {
+        error_log("emerg", "out of memory");
+        keepalive_free();
+        close_listeners(&listeners);
         return 1;
     }
 
@@ -318,6 +354,7 @@ int loop_run(const Config *config) {
             conn_close(&connections[i]);
         }
     }
+    keepalive_free();
     close_listeners(&listeners);
     return 0;
 }

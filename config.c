@@ -17,6 +17,10 @@
 #define MAX_ARGUMENTS 8  // nginx's NGX_CONF_MAX_ARGS.
 #define DEFAULT_TIMEOUT 60.0
 #define DEFAULT_MAX_BODY_SIZE (1024 * 1024)
+#define DEFAULT_KEEPALIVE_TIMEOUT 75.0
+#define DEFAULT_UPSTREAM_KEEPALIVE_TIMEOUT 60.0
+#define DEFAULT_KEEPALIVE_REQUESTS 1000
+#define DEFAULT_KEEPALIVE_TIME 3600.0
 
 // nginx's own proxy headers, under any proxy_set_header.
 static const Header DEFAULT_PROXY_HEADERS[] = {
@@ -71,14 +75,24 @@ typedef struct {
     int opens_block;
 } Directive;
 
+// What an upstream block writes, until it's checked and put in its
+// Upstream.
+typedef struct {
+    OptionalCount keepalive;
+    OptionalSeconds keepalive_timeout;
+    OptionalCount keepalive_requests;
+    OptionalSeconds keepalive_time;
+} UpstreamSettings;
+
 // The block being read. server, location and upstream are NULL outside
-// them, and settings in an upstream.
+// them. settings is NULL in an upstream, and upstream_settings outside one.
 typedef struct {
     Context context;
     Server *server;
     Location *location;
     BlockSettings *settings;
     Upstream *upstream;
+    UpstreamSettings *upstream_settings;
 } Scope;
 
 static int parse_error(Parser *parser, size_t line, const char *format, ...)
@@ -386,7 +400,9 @@ struct DirectiveSpec {
     size_t min_arguments;
     size_t max_arguments;
     DirectiveHandler handle;
-    size_t offset;  // Into BlockSettings, for handle_seconds and handle_size.
+    // Into the block's BlockSettings, or UpstreamSettings in an upstream,
+    // for handle_seconds, handle_size and handle_count.
+    size_t offset;
 };
 
 static int parse_block(Parser *parser, const Scope *scope);
@@ -409,7 +425,7 @@ static int handle_http(Parser *parser, const Scope *scope,
                        const Directive *directive,
                        const DirectiveSpec *spec) {
     Config *config = parser->config;
-    Scope inner = {CONTEXT_HTTP, NULL, NULL, &config->http, NULL};
+    Scope inner = {CONTEXT_HTTP, NULL, NULL, &config->http, NULL, NULL};
 
     (void)scope;
     (void)spec;
@@ -479,7 +495,8 @@ static int handle_server(Parser *parser, const Scope *scope,
     server->line = directive->line;
     block_settings_init(&server->written);
 
-    Scope inner = {CONTEXT_SERVER, server, NULL, &server->written, NULL};
+    Scope inner = {CONTEXT_SERVER, server, NULL, &server->written, NULL,
+                   NULL};
     if (!parse_block(parser, &inner)) {
         return 0;
     }
@@ -594,7 +611,7 @@ static int handle_location(Parser *parser, const Scope *scope,
     block_settings_init(&location->written);
 
     Scope inner = {CONTEXT_LOCATION, server, location, &location->written,
-                   NULL};
+                   NULL, NULL};
     return parse_block(parser, &inner);
 }
 
@@ -736,8 +753,13 @@ static Upstream *add_upstream(Config *config, UpstreamKind kind,
     upstream->kind = kind;
     upstream->name = copy;
     upstream->line = line;
+    upstream->number = config->upstream_count;
     upstream->peers = NULL;
     upstream->peer_count = 0;
+    upstream->keepalive.connections = 0;
+    upstream->keepalive.requests = DEFAULT_KEEPALIVE_REQUESTS;
+    upstream->keepalive.time = DEFAULT_KEEPALIVE_TIME;
+    upstream->keepalive.timeout = DEFAULT_UPSTREAM_KEEPALIVE_TIMEOUT;
     config->upstreams[config->upstream_count++] = upstream;
     return upstream;
 }
@@ -773,13 +795,46 @@ static int handle_upstream(Parser *parser, const Scope *scope,
         return out_of_memory(parser, directive);
     }
 
-    Scope inner = {CONTEXT_UPSTREAM, NULL, NULL, NULL, upstream};
+    UpstreamSettings written;
+    memset(&written, 0, sizeof(written));
+    Scope inner = {CONTEXT_UPSTREAM, NULL, NULL, NULL, upstream, &written};
     if (!parse_block(parser, &inner)) {
         return 0;
     }
     if (upstream->peer_count == 0) {
         return parse_error(parser, directive->line,
                            "no servers are inside upstream");
+    }
+
+    UpstreamKeepalive *keepalive = &upstream->keepalive;
+    if (written.keepalive.is_set) {
+        keepalive->connections = written.keepalive.count;
+    }
+    if (written.keepalive_requests.is_set) {
+        keepalive->requests = written.keepalive_requests.count;
+    }
+    if (written.keepalive_time.is_set) {
+        keepalive->time = written.keepalive_time.seconds;
+    }
+    if (written.keepalive_timeout.is_set) {
+        keepalive->timeout = written.keepalive_timeout.seconds;
+    }
+    return 1;
+}
+
+// A whole number, as nginx's ngx_atoi.
+static int parse_count(const char *text, size_t *count) {
+    *count = 0;
+    if (*text == '\0') {
+        return 0;
+    }
+    for (const char *c = text; *c; c++) {
+        size_t digit = (size_t)(*c - '0');
+
+        if (*c < '0' || *c > '9' || *count > (SIZE_MAX - digit) / 10) {
+            return 0;
+        }
+        *count = *count * 10 + digit;
     }
     return 1;
 }
@@ -954,11 +1009,19 @@ static int handle_access_log(Parser *parser, const Scope *scope,
     return 1;
 }
 
+// Where spec's offset points into: the upstream's settings in an upstream
+// block, or else the block's.
+static void *setting_at(const Scope *scope, const DirectiveSpec *spec) {
+    char *base = scope->context == CONTEXT_UPSTREAM
+                     ? (char *)scope->upstream_settings
+                     : (char *)scope->settings;
+    return base + spec->offset;
+}
+
 static int handle_seconds(Parser *parser, const Scope *scope,
                           const Directive *directive,
                           const DirectiveSpec *spec) {
-    OptionalSeconds *setting =
-        (OptionalSeconds *)((char *)scope->settings + spec->offset);
+    OptionalSeconds *setting = setting_at(scope, spec);
 
     if (setting->is_set) {
         return duplicate(parser, directive);
@@ -995,8 +1058,7 @@ static int handle_http_version(Parser *parser, const Scope *scope,
 static int handle_size(Parser *parser, const Scope *scope,
                        const Directive *directive,
                        const DirectiveSpec *spec) {
-    OptionalSize *setting =
-        (OptionalSize *)((char *)scope->settings + spec->offset);
+    OptionalSize *setting = setting_at(scope, spec);
 
     if (setting->is_set) {
         return duplicate(parser, directive);
@@ -1008,8 +1070,57 @@ static int handle_size(Parser *parser, const Scope *scope,
     return 1;
 }
 
+// A whole number, as nginx's keepalive_requests. keepalive's N must be at
+// least 1.
+static int handle_count(Parser *parser, const Scope *scope,
+                        const Directive *directive,
+                        const DirectiveSpec *spec) {
+    OptionalCount *setting = setting_at(scope, spec);
+    int is_keepalive = strcmp(directive->name, "keepalive") == 0;
+    size_t count;
+
+    if (setting->is_set) {
+        return duplicate(parser, directive);
+    }
+    if (!parse_count(directive->arguments[0], &count) ||
+        (is_keepalive && count == 0)) {
+        return invalid_value(parser, directive);
+    }
+    setting->count = count;
+    setting->is_set = 1;
+    return 1;
+}
+
+// "keepalive_timeout 75s;" or, with "Keep-Alive: timeout=60" in kept
+// replies, "keepalive_timeout 75s 60s;".
+static int handle_keepalive_timeout(Parser *parser, const Scope *scope,
+                                    const Directive *directive,
+                                    const DirectiveSpec *spec) {
+    OptionalKeepaliveTimeout *setting = &scope->settings->keepalive_timeout;
+
+    (void)spec;
+    if (setting->is_set) {
+        return duplicate(parser, directive);
+    }
+    if (!parse_seconds(directive->arguments[0], &setting->seconds)) {
+        return invalid_value(parser, directive);
+    }
+    if (directive->argument_count > 1) {
+        if (!parse_seconds(directive->arguments[1],
+                           &setting->header.seconds)) {
+            return invalid_value(parser, directive);
+        }
+        setting->header.is_set = 1;
+    }
+    setting->is_set = 1;
+    return 1;
+}
+
 #define SECONDS(name, contexts)                                             \
     {#name, contexts, 0, 1, 1, handle_seconds, offsetof(BlockSettings, name)}
+#define UPSTREAM(name, handler)                                             \
+    {#name, CONTEXT_UPSTREAM, 0, 1, 1, handler,                             \
+     offsetof(UpstreamSettings, name)}
 
 static const DirectiveSpec DIRECTIVES[] = {
     {"http", CONTEXT_MAIN, 1, 0, 0, handle_http, 0},
@@ -1034,6 +1145,15 @@ static const DirectiveSpec DIRECTIVES[] = {
     SECONDS(proxy_send_timeout, ANY_HTTP_BLOCK),
     SECONDS(proxy_read_timeout, ANY_HTTP_BLOCK),
     SECONDS(send_timeout, ANY_HTTP_BLOCK),
+    {"keepalive_timeout", ANY_HTTP_BLOCK, 0, 1, 2, handle_keepalive_timeout,
+     0},
+    {"keepalive_requests", ANY_HTTP_BLOCK, 0, 1, 1, handle_count,
+     offsetof(BlockSettings, keepalive_requests)},
+    SECONDS(keepalive_time, ANY_HTTP_BLOCK),
+    UPSTREAM(keepalive, handle_count),
+    UPSTREAM(keepalive_timeout, handle_seconds),
+    UPSTREAM(keepalive_requests, handle_count),
+    UPSTREAM(keepalive_time, handle_seconds),
 };
 
 // The spec for name in context, or else any for name, for the "not allowed
@@ -1187,6 +1307,18 @@ static Settings inherit(const BlockSettings *own, const Settings *outer) {
     settings.proxy_http_version = own->proxy_http_version.is_set
                                       ? own->proxy_http_version.version
                                       : outer->proxy_http_version;
+    if (own->keepalive_timeout.is_set) {
+        settings.keepalive_timeout = own->keepalive_timeout.seconds;
+        settings.keepalive_header_timeout = own->keepalive_timeout.header;
+    } else {
+        settings.keepalive_timeout = outer->keepalive_timeout;
+        settings.keepalive_header_timeout = outer->keepalive_header_timeout;
+    }
+    settings.keepalive_requests = own->keepalive_requests.is_set
+                                      ? own->keepalive_requests.count
+                                      : outer->keepalive_requests;
+    settings.keepalive_time =
+        inherit_seconds(&own->keepalive_time, outer->keepalive_time);
     settings.proxy_set_headers = own->proxy_set_headers.count > 0
                                      ? own->proxy_set_headers
                                      : outer->proxy_set_headers;
@@ -1207,6 +1339,11 @@ static Settings default_settings(void) {
     settings.send_timeout = DEFAULT_TIMEOUT;
     settings.client_max_body_size = DEFAULT_MAX_BODY_SIZE;
     settings.proxy_http_version = HTTP_1_0;
+    settings.keepalive_timeout = DEFAULT_KEEPALIVE_TIMEOUT;
+    settings.keepalive_header_timeout.is_set = 0;
+    settings.keepalive_header_timeout.seconds = 0;
+    settings.keepalive_requests = DEFAULT_KEEPALIVE_REQUESTS;
+    settings.keepalive_time = DEFAULT_KEEPALIVE_TIME;
     settings.proxy_set_headers.items = NULL;
     settings.proxy_set_headers.count = 0;
     settings.access_log.kind = ACCESS_LOG_OFF;
@@ -1459,7 +1596,7 @@ int config_load(Config *config, const char *path, char *error,
     parser.error = error;
     parser.error_size = error_size;
 
-    Scope top = {CONTEXT_MAIN, NULL, NULL, NULL, NULL};
+    Scope top = {CONTEXT_MAIN, NULL, NULL, NULL, NULL, NULL};
     int ok = parse_block(&parser, &top) && link_proxy_passes(&parser) &&
              group_servers(&parser);
     free(text);

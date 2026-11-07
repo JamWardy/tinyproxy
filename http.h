@@ -34,6 +34,10 @@ int is_space(char c);
 char *trim(char *text);
 
 int is_letter_or_digit(char c);
+
+// Whether word is anywhere in text, ignoring case, as nginx looks for
+// "close" in Connection.
+int contains_ignoring_case(const char *text, const char *word);
 int is_digit(char c);
 
 // Reads "HTTP/major.minor" up to the end of text or a space.

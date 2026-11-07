@@ -15,13 +15,23 @@ typedef enum {
     UPSTREAM_IMPLICIT,  // Made for a proxy_pass to an address, as nginx does.
 } UpstreamKind;
 
+// How its idle connections are kept, from the upstream block.
+typedef struct {
+    size_t connections;  // keepalive's N; 0, with none, keeps none.
+    size_t requests;     // keepalive_requests.
+    double time;         // keepalive_time.
+    double timeout;      // keepalive_timeout.
+} UpstreamKeepalive;
+
 // A pool of servers, nginx's upstream.
 typedef struct {
     UpstreamKind kind;
     char *name;  // The block's name, or the host and port.
     size_t line;
+    size_t number;  // Its place in Config.upstreams.
     Peer *peers;
     size_t peer_count;
+    UpstreamKeepalive keepalive;
 } Upstream;
 
 typedef enum {

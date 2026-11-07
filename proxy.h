@@ -33,17 +33,39 @@ int build_upstream_request(Buffer *out, const Request *request,
 // The length of the reply's head in data, or 0 if it isn't all in yet.
 size_t find_reply_head(const char *data, size_t size);
 
+// Where the reply's body ends.
+typedef enum {
+    REPLY_NO_BODY,      // To HEAD, and for 1xx, 204 and 304.
+    REPLY_LENGTH,       // After Content-Length bytes.
+    REPLY_CHUNKED,      // At the last chunk.
+    REPLY_UNTIL_CLOSE,  // With neither, when the upstream closes.
+} ReplyFraming;
+
 typedef struct {
     int status;
-    // A chunked body for a client older than HTTP/1.1, which can't read
-    // chunks, so they're decoded and the body ends at the close.
-    int decode_chunks;
+    ReplyFraming framing;
+    size_t length;  // REPLY_LENGTH's.
+    // HTTP/1.1 without Connection: close, so the upstream connection may be
+    // kept once the reply's in.
+    int upstream_keeps;
 } ReplyHead;
 
-// The upstream's reply head as a client of client_version gets it, with
-// tinyproxy's own Server, Date and Connection. Returns 0 and fills reply, or
-// else the status to answer with instead.
-int rewrite_reply_head(Buffer *out, const char *head, size_t length,
-                       int client_version, ReplyHead *reply);
+// Reads the upstream's reply head, for a request that was HEAD or not.
+// Returns 0 and fills reply, or else the status to answer with instead.
+int parse_reply_head(const char *head, size_t length, int to_head,
+                     ReplyHead *reply);
+
+// How the body goes on to the client.
+typedef enum {
+    REPLY_BODY_AS_IS,
+    REPLY_BODY_DECODED,  // From chunks, for a client that can't read them.
+    REPLY_BODY_ENCODED,  // Into chunks, as it has no length of its own.
+} ReplyBody;
+
+// A head that parse_reply_head took, as the client gets it: with
+// tinyproxy's own Server and Date, the Transfer-Encoding body needs, and
+// connection, the Connection header lines. Fails only when out of memory.
+int write_reply_head(Buffer *out, const char *head, size_t length,
+                     ReplyBody body, const char *connection);
 
 #endif

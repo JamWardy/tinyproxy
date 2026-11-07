@@ -29,13 +29,15 @@ each connection is a state machine:
 
 ```
 READING_HEAD ─► READING_BODY ─► CONNECTING ─► SENDING_REQUEST ─► READING_REPLY_HEAD
-  ─► READING_REPLY ─► SENDING_REPLY ─► closed
+  ─► READING_REPLY ─► SENDING_REPLY ─► closed, or KEEPALIVE ─► READING_HEAD
 ```
 
 `READING_REPLY` passes the reply on as it comes, and `SENDING_REPLY`
-sends what's left once the upstream has closed. Any state up to
+sends what's left once the upstream's reply is all in. Any state up to
 `READING_REPLY_HEAD` can instead go to `SENDING_ERROR`, tinyproxy's
-own reply, then `LINGERING`, its gentle close.
+own reply, then `LINGERING`, its gentle close, or with keep-alive
+(stage 5), `DISCARDING_BODY` or `KEEPALIVE`. A request on an idle
+upstream connection skips `CONNECTING`.
 
 Each state has a deadline from the timeouts below, and the loop's
 `select()` timeout is the nearest one. A non-blocking `connect()`
@@ -85,9 +87,9 @@ A request that matches no `location` gets `404`.
 ## Sending it on
 
 - As the HTTP version `proxy_http_version` says: `1.0`, nginx's
-  default, or `1.1`, which the shop's config sets. Either way it opens
-  a new connection for each request and sends `Connection: close`,
-  until stage 5 adds keep-alive.
+  default, or `1.1`, which the shop's config sets. It opens a new
+  connection for each request, unless stage 5's `keepalive` has an
+  idle one.
 - With nginx's default headers, `Host: $proxy_host` (the host and port
   in `proxy_pass`) and `Connection: close`, and the client's others as
   they are. `proxy_set_header` adds or replaces one, and an empty value
@@ -119,7 +121,8 @@ A request that matches no `location` gets `404`.
   yet, and otherwise cuts it off.
 - The headers go back as they came, except `Date` and `Server`, which
   are tinyproxy's own (`Server: tinyproxy`), as in nginx's
-  `proxy_hide_header` defaults, and `Connection: close`.
+  `proxy_hide_header` defaults, and `Connection` and `Keep-Alive`, which
+  say whether tinyproxy keeps the client's connection (stage 5).
 
 ## Its own replies
 
@@ -136,7 +139,8 @@ nginx's statuses, with its small HTML page:
 ```
 
 Then it closes gently, as nginx's `lingering_close` does, so the client
-reads the reply before the connection drops. The gateway swaps these
+reads the reply before the connection drops, unless stage 5 keeps the
+connection. The gateway swaps these
 for Problem Details (stage 8), as Kong swaps nginx's pages for JSON.
 
 ## Logs
@@ -221,14 +225,69 @@ Each stage adds nginx's directives for it.
      say which stage until then.
    - The error log's `upstream:` is the server's own address, such as
      `http://127.0.0.1:8003/search`.
-5. **Keep-alive:** as nginx's, `proxy_http_version 1.1`,
-   `proxy_set_header Connection ""` and `keepalive N;` in an
-   `upstream` block keep up to N idle connections to its servers open
-   for the next request, each for up to `keepalive_timeout` (60 s) in
-   the `upstream` block, and `keepalive_timeout` (75 s) in `http` or
-   `server` keeps a client's open for its next one. It needs tinyhttp's
-   keep-alive, in `../tinyhttp/DESIGN.md`, whose idle time in the shop
-   is longer, so tinyproxy always closes an idle connection first.
+5. **Keep-alive:** as nginx's, with the client and with the upstream.
+   With the client:
+   - HTTP/1.1 keeps the connection unless its `Connection` has
+     `close` in it; HTTP/1.0 only if it has `keep-alive`. The reply
+     says `Connection: keep-alive`, or `Connection: close` when it's
+     the last.
+   - `keepalive_timeout` (75 s) in `http`, `server` or `location` is
+     how long it waits for the next request, and `0` turns keep-alive
+     off. A second argument, such as `keepalive_timeout 75s 60s`, adds
+     `Keep-Alive: timeout=60` to kept replies. `keepalive_requests`
+     (1000) and `keepalive_time` (1 h) make the reply that reaches that
+     many requests, or that long since the connection was accepted,
+     the last. `client_header_timeout` starts at the next request's
+     first byte.
+   - Requests sent before the last reply came back (pipelined) are
+     served in order.
+   - A reply whose end the client can only find by the close ends the
+     connection: a chunked reply decoded for HTTP/1.0, or one with
+     neither `Content-Length` nor chunks to HTTP/1.0. To HTTP/1.1, such
+     a reply goes chunked, as nginx's `chunked_transfer_encoding on`
+     does, and the connection stays.
+   - tinyproxy's own replies keep it too, except `400`, `408`, `413`,
+     `414` and `500`, and any to a request it couldn't read. A body not
+     yet read, as with a `404` before it came, is read and dropped
+     first, after a `100 Continue` if the client asked for one, with
+     the gentle close's limits; past them it closes.
+   - A connection that closes with more requests already sent closes
+     gently.
+   - When all of its connections are in use, a new one closes the idle
+     connection that has waited longest, with nginx's `[warn] 500
+     worker_connections are not enough, reusing connections`.
+
+   With the upstream:
+   - `keepalive N;` in an `upstream` block keeps up to N idle
+     connections to its servers, closing the least recently used to
+     make room for another. It needs `proxy_http_version 1.1` and
+     `proxy_set_header Connection ""`, so the upstream isn't told to
+     close. A pool with no `keepalive`, such as a `proxy_pass` to an
+     address, closes each connection after its reply.
+   - A request goes on the most recently idle connection to the
+     server chosen, or else a new one.
+   - A connection is kept once its whole reply is in: up to its
+     `Content-Length` or last chunk, or with no body for `HEAD`, `1xx`,
+     `204` and `304`. It isn't after an HTTP/1.0 reply, a reply with
+     `Connection: close`, an error or a timeout, or a reply the
+     upstream sent more after, which gets nginx's `[warn] upstream sent
+     more data than specified in "Content-Length" header` or `upstream
+     sent data after final chunk`. A reply that ends early cuts the
+     client's off, with `upstream prematurely closed connection while
+     reading upstream`.
+   - In the `upstream` block, `keepalive_timeout` (60 s) closes an idle
+     connection, and `keepalive_requests` (1000) and `keepalive_time`
+     (1 h) close one, instead of keeping it, after that many requests
+     or that long since it was opened. An idle one that turns readable,
+     as when the server closes it, is closed.
+   - A request that fails with an error on a reused connection, before
+     its reply's head is in, is sent again on another idle connection
+     or a new one, as the server may have closed it just as it was
+     reused. Never for `POST`, `PATCH` or `LOCK`, which get `502`, as
+     they might have been acted on. Each failure is logged.
+   - It needs tinyhttp's keep-alive, in `../tinyhttp/DESIGN.md`, whose
+     idle time in the shop is longer, so tinyproxy always closes an
+     idle connection first.
 6. **Load balancing:** round robin by default, with `weight=` on a
    `server`; `least_conn;` picks the one with the fewest open
    connections.
@@ -262,7 +321,8 @@ Stages 9 and 10 are the gateway's.
 - No `location` inside another; nginx allows them. One stops it
   starting.
 - One `access_log` per block; nginx can write to several.
-- No keep-alive, with the client or the upstream, until stage 5.
+- No `keepalive_disable`, which turns keep-alive off for old browsers,
+  or `chunked_transfer_encoding off`.
 - `select()` can't wait on a file descriptor over 1023, so about a
   thousand connections at once is the limit.
 - No temporary files: bodies and replies are held in memory.

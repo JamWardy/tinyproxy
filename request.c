@@ -222,10 +222,19 @@ static int is_passed_on(const char *name) {
     return 1;
 }
 
+// What a Connection header asked for, as nginx reads it.
+typedef enum {
+    CONNECTION_UNSAID,
+    CONNECTION_CLOSE,
+    CONNECTION_KEEP_ALIVE,
+} ConnectionType;
+
 typedef struct {
     int host;
     int content_length;
+    ConnectionType connection;
 } SeenHeaders;
+
 
 // Acts on the headers that change how the request is read.
 static int take_special_header(Request *request, const char *name,
@@ -256,6 +265,14 @@ static int take_special_header(Request *request, const char *name,
         // A request's transfer coding must end in chunked, which tinyproxy
         // can't read, so any is refused as nginx did before it could.
         return 411;
+    } else if (strcasecmp(name, "Connection") == 0) {
+        // As nginx, "close" anywhere in it wins, so "keep-alive, close"
+        // closes.
+        if (contains_ignoring_case(value, "close")) {
+            seen->connection = CONNECTION_CLOSE;
+        } else if (contains_ignoring_case(value, "keep-alive")) {
+            seen->connection = CONNECTION_KEEP_ALIVE;
+        }
     } else if (strcasecmp(name, "Expect") == 0) {
         request->expects_continue = request->version >= HTTP_1_1 &&
                                     strcasecmp(value, "100-continue") == 0;
@@ -314,6 +331,7 @@ void request_init(Request *request) {
     request->header_count = 0;
     request->content_length = 0;
     request->expects_continue = 0;
+    request->keepalive = 0;
 }
 
 void request_free(Request *request) {
@@ -335,7 +353,7 @@ static size_t count_lines(const char *data, size_t length) {
 }
 
 int request_parse(Request *request, const char *head, size_t length) {
-    SeenHeaders seen = {0, 0};
+    SeenHeaders seen = {0, 0, CONNECTION_UNSAID};
 
     if (memchr(head, '\0', length)) {
         return 400;
@@ -375,6 +393,17 @@ int request_parse(Request *request, const char *head, size_t length) {
             return 500;
         }
         request->host[0] = '\0';
+    }
+    switch (seen.connection) {
+        case CONNECTION_UNSAID:
+            request->keepalive = request->version >= HTTP_1_1;
+            break;
+        case CONNECTION_CLOSE:
+            request->keepalive = 0;
+            break;
+        case CONNECTION_KEEP_ALIVE:
+            request->keepalive = 1;
+            break;
     }
     return 0;
 }

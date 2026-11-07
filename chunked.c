@@ -115,19 +115,21 @@ static int take_framing_byte(ChunkDecoder *decoder, char c) {
 }
 
 ChunksResult chunk_decode(ChunkDecoder *decoder, const char *data,
-                          size_t size, Buffer *out) {
+                          size_t size, Buffer *out, size_t *used) {
     size_t i = 0;
 
     while (i < size && decoder->state != CHUNK_DONE) {
         if (decoder->state != CHUNK_DATA) {
             if (!take_framing_byte(decoder, data[i])) {
+                *used = i;
                 return CHUNKS_INVALID;
             }
             i++;
             continue;
         }
         size_t run = size - i < decoder->size ? size - i : decoder->size;
-        if (!buffer_append(out, data + i, run)) {
+        if (out && !buffer_append(out, data + i, run)) {
+            *used = i;
             return CHUNKS_OUT_OF_MEMORY;
         }
         i += run;
@@ -136,5 +138,16 @@ ChunksResult chunk_decode(ChunkDecoder *decoder, const char *data,
             decoder->state = CHUNK_DATA_CR;
         }
     }
+    *used = i;
     return CHUNKS_OK;
+}
+
+int chunk_encode(Buffer *out, const char *data, size_t size) {
+    return size == 0 ||
+           (buffer_appendf(out, "%zx\r\n", size) &&
+            buffer_append(out, data, size) && buffer_append(out, "\r\n", 2));
+}
+
+int chunk_encode_end(Buffer *out) {
+    return buffer_append_text(out, "0\r\n\r\n");
 }

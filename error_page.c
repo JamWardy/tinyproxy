@@ -41,7 +41,7 @@ static const ErrorPage *find_error_page(int status) {
 }
 
 int build_error_reply(Buffer *out, int status, int with_body,
-                      const char *location) {
+                      const char *location, const char *connection) {
     const ErrorPage *page = find_error_page(status);
     char date[40];
     Buffer html;
@@ -71,7 +71,8 @@ int build_error_reply(Buffer *out, int status, int with_body,
                               page->status_line, date, buffer_length(&html)) &&
          (!location ||
           buffer_appendf(out, "Location: %s\r\n", location)) &&
-         buffer_append_text(out, "Connection: close\r\n\r\n");
+         buffer_append_text(out, connection) &&
+         buffer_append(out, "\r\n", 2);
     if (ok && with_body) {
         ok = buffer_append(out, buffer_bytes(&html), buffer_length(&html));
     }

@@ -1,6 +1,7 @@
 #include "http.h"
 
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 char *next_line(char **text) {
@@ -79,4 +80,15 @@ void format_http_date(char *out, size_t size) {
 
     gmtime_r(&now, &utc);
     strftime(out, size, "%a, %d %b %Y %H:%M:%S GMT", &utc);
+}
+
+int contains_ignoring_case(const char *text, const char *word) {
+    size_t length = strlen(word);
+
+    for (; *text; text++) {
+        if (strncasecmp(text, word, length) == 0) {
+            return 1;
+        }
+    }
+    return 0;
 }

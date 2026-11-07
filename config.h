@@ -19,8 +19,21 @@ typedef struct {
 
 typedef struct {
     int is_set;
+    size_t count;
+} OptionalCount;
+
+typedef struct {
+    int is_set;
     int version;  // HTTP_1_0 or HTTP_1_1.
 } OptionalHttpVersion;
+
+// keepalive_timeout's two arguments: the wait, then the optional
+// "Keep-Alive: timeout=N".
+typedef struct {
+    int is_set;
+    double seconds;
+    OptionalSeconds header;
+} OptionalKeepaliveTimeout;
 
 typedef enum {
     ACCESS_LOG_UNSET,
@@ -44,6 +57,9 @@ typedef struct {
     OptionalSeconds send_timeout;
     OptionalSize client_max_body_size;
     OptionalHttpVersion proxy_http_version;
+    OptionalKeepaliveTimeout keepalive_timeout;
+    OptionalCount keepalive_requests;
+    OptionalSeconds keepalive_time;
     // As in nginx, a block that sets any inherits none from around it.
     Headers proxy_set_headers;
     AccessLog access_log;
@@ -60,6 +76,10 @@ typedef struct {
     double send_timeout;
     size_t client_max_body_size;  // 0 for no limit.
     int proxy_http_version;
+    double keepalive_timeout;  // 0 for no keep-alive.
+    OptionalSeconds keepalive_header_timeout;
+    size_t keepalive_requests;
+    double keepalive_time;
     Headers proxy_set_headers;
     AccessLog access_log;  // ACCESS_LOG_OFF or ACCESS_LOG_FILE.
 } Settings;

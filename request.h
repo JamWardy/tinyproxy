@@ -40,6 +40,9 @@ typedef struct {
     size_t header_count;
     size_t content_length;
     int expects_continue;
+    // The client asked to keep the connection, by its version and
+    // Connection.
+    int keepalive;
 } Request;
 
 void request_init(Request *request);

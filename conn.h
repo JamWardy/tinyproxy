@@ -8,6 +8,8 @@
 #include "buffer.h"
 #include "chunked.h"
 #include "config.h"
+#include "keepalive.h"
+#include "proxy.h"
 #include "request.h"
 
 // Each has a descriptor for the client and one upstream, and select can't
@@ -26,19 +28,18 @@ typedef enum {
     CONN_SENDING_ERROR,      // tinyproxy's own reply.
     CONN_LINGERING,          // Reading and dropping what the client still
                              // sends, so it gets the reply before the close.
+    CONN_DISCARDING_BODY,    // Dropping the body of a request answered
+                             // before it came, to keep the connection.
+    CONN_KEEPALIVE,          // Waiting for the next request.
 } ConnState;
-
-typedef enum {
-    REPLY_BODY_AS_IS,
-    REPLY_BODY_DECODED,  // From chunks, for a client that can't read them.
-} ReplyBody;
 
 typedef struct {
     ConnState state;
     unsigned long long number;  // nginx's *N in the error log.
     int client_fd;
-    int upstream_fd;            // From CONN_CONNECTING to CONN_READING_REPLY.
+    UpstreamConn upstream;  // From CONN_CONNECTING to CONN_READING_REPLY.
     char remote_addr[INET_ADDRSTRLEN];
+    size_t requests;  // On this connection, the current one included.
 
     // Borrowed from the config. The server is the group's default until the
     // request's Host picks one. The settings are the server's until the
@@ -49,25 +50,35 @@ typedef struct {
     const Peer *peer;          // The server it's sent to; NULL until chosen.
     const Settings *settings;
 
-    Buffer from_client;  // The request's head, then its body.
+    // The request's head, then its body, then any requests sent after it.
+    Buffer from_client;
     size_t head_length;  // Of the head in from_client, once it's all in.
     Request request;
+    // The client sent the next request while the upstream had this one.
+    // It's kept, and the client isn't read again until this one's done.
+    int pipelined;
+    size_t discarding;  // CONN_DISCARDING_BODY's bytes still to come.
     Buffer upstream_uri;  // With a NUL after it, once there's a location.
     Buffer to_upstream;
     Buffer from_upstream;  // What's come from the upstream, until it's used.
     Buffer to_client;
+    // Once its head is in. Its length counts down as the body comes.
+    ReplyHead reply;
     ReplyBody reply_body;
-    ChunkDecoder chunks;  // REPLY_BODY_DECODED's.
+    ChunkDecoder chunks;  // REPLY_CHUNKED's.
+    int keepalive;  // The reply keeps the client's connection.
 
     int status;                // What the access log shows.
     size_t reply_head_length;  // So the log can count only the body.
     size_t sent;               // Bytes sent to the client.
 
     double accepted_at;
+    double request_at;  // When the current request's head started.
     // When each side last moved, or when there was first something to send.
     double client_io_at;
     double upstream_io_at;
-    double lingering_since;  // CONN_LINGERING's.
+    // CONN_LINGERING's and CONN_DISCARDING_BODY's.
+    double lingering_since;
 } Connection;
 
 int set_non_blocking(int fd);

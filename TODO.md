@@ -16,6 +16,7 @@ tinyproxy/
   uri.c/.h        normalising the path, and escaping it again
   route.c/.h      choosing the server and the location
   upstream.c/.h   upstream pools and choosing a server from one
+  keepalive.c/.h  idle upstream connections, kept for the next request
   variables.c/.h  $host and the others, for proxy_set_header
   error_page.c/.h tinyproxy's own replies and nginx's pages
   http.c/.h       what those share: header types, versions, line helpers
@@ -80,8 +81,24 @@ tinyproxy/
   - [x] Try it by hand: a pool and a plain address side by side, an
         `upstream` after its use, each config error, a pool whose
         server is down (`502`), and the shop through pools
-- [ ] 5: keep-alive, `keepalive` in `upstream` blocks and
-      `keepalive_timeout`, once tinyhttp has it
+- [x] 5: keep-alive, as in `DESIGN.md`:
+  - [x] `keepalive_timeout`, `keepalive_requests` and `keepalive_time`,
+        for clients and in `upstream` blocks, and `keepalive`
+  - [x] Where each reply ends: `Content-Length`, the last chunk, or no
+        body, and chunking one with neither for HTTP/1.1
+  - [x] Clients: `KEEPALIVE` between requests, pipelined requests, own
+        replies that keep the connection, `DISCARDING_BODY`, and
+        reusing the longest-idle connection when they run out
+  - [x] Upstreams: the idle connections in `keepalive.c`, taking and
+        keeping them, and sending a request again when a reused one
+        fails
+  - [x] Try it by hand: several requests on one `curl` connection,
+        pipelined requests with `nc`, HTTP/1.0 with and without
+        `keep-alive`, `keepalive_requests 2`, a `404` with a body still
+        to come, the shop through pools with `keepalive`, one upstream
+        connection reused across clients, a service restarted under
+        tinyproxy (a `GET` sent again, a `POST` getting `502`), and
+        idle connections timing out on both sides
 - [ ] 6: round robin with `weight=`, and `least_conn`
 - [ ] 7: `max_fails` and `fail_timeout`
 
