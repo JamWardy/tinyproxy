@@ -11,9 +11,9 @@ typedef struct {
     const char *remote_addr;
     const char *proxy_host;
     const char *proxy_add_x_forwarded_for;
-    const char *request_uri;  // The path and query as the client sent them.
-    const char *uri;          // The normalised path.
-    const char *args;         // The query, or "" if there's none.
+    const char *path_and_query;  // As the client sent them.
+    const char *path;            // Normalised.
+    const char *query;           // "" if there's none.
 } Variables;
 
 // At a '$': finds the name in $name or ${name}. Returns how many bytes the

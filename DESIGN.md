@@ -1,13 +1,31 @@
 # How tinyproxy works
 
-A reverse proxy in C, as nginx is: the core of nginx, as tinyweb is
-the core of Flask. It copies nginx's behaviour, directive names and
-defaults, and where this file doesn't say, it does what nginx does. It
-uses ideas from nginx and OpenResty, never their code: C99, the C
-library and POSIX, built with `make` as `../tinysql/` is, and from
-stage 8 CPython's embedding API (`Python.h`), which comes with Python.
+A reverse proxy in C, for learning how real ones such as nginx work,
+as tinyweb is for Flask. Understanding comes first. It behaves as nginx
+does, so what it teaches holds for real proxies, and where this file
+doesn't say, it does what nginx does. But it isn't a copy: where a name
+or an accident of nginx's code would make the system harder to
+understand, it uses a clearer one and gives nginx's alongside. Its
+config is in nginx's style, but needn't be valid nginx. It uses ideas
+from nginx and OpenResty, never their code: C99, the C library and
+POSIX, built with `make` as `../tinysql/` is, and from stage 8
+CPython's embedding API (`Python.h`), which comes with Python.
 
 `../tinygateway/` runs inside it, as Kong runs inside OpenResty.
+
+## Terms
+
+- **Server:** a `server { ... }` block, the addresses tinyproxy listens
+  on and the names it answers to (a virtual server).
+- **Upstream:** a pool of endpoints that all serve the same thing, such
+  as the shop's search service: an `upstream name { ... }` block, or
+  one made for a `proxy_pass` to an address.
+- **Host:** one `host name:port;` line in an upstream (nginx's
+  `server`). Its name may resolve to several addresses.
+- **Endpoint:** one address and port a host resolved to, where a
+  request is sent (nginx's peer). The load balancer picks an endpoint
+  for each request. Two services on one machine are two endpoints;
+  nothing stands for the machine.
 
 ## Running it
 
@@ -29,14 +47,14 @@ each connection is a state machine:
 
 ```
 READING_HEAD ─► READING_BODY ─► CONNECTING ─► SENDING_REQUEST ─► READING_REPLY_HEAD
-  ─► READING_REPLY ─► SENDING_REPLY ─► closed, or KEEPALIVE ─► READING_HEAD
+  ─► READING_REPLY ─► SENDING_REPLY ─► closed, or IDLE ─► READING_HEAD
 ```
 
 `READING_REPLY` passes the reply on as it comes, and `SENDING_REPLY`
 sends what's left once the upstream's reply is all in. Any state up to
-`READING_REPLY_HEAD` can instead go to `SENDING_ERROR`, tinyproxy's
-own reply, then `LINGERING`, its gentle close, or with keep-alive
-(stage 5), `DISCARDING_BODY` or `KEEPALIVE`. A request on an idle
+`READING_REPLY_HEAD` can instead go to `SENDING_OWN_REPLY`, such as a
+`502` or a redirect, then `LINGERING`, its gentle close, or with
+keep-alive (stage 5), `DISCARDING_BODY` or `IDLE`. A request on an idle
 upstream connection skips `CONNECTING`.
 
 Each state has a deadline from the timeouts below, and the loop's
@@ -78,8 +96,8 @@ A request that matches no `location` gets `404`.
 - The body: `Content-Length` bytes, up to `client_max_body_size`
   (default `1m`), or `413`. It's read in full before the upstream is
   connected, as nginx's `proxy_request_buffering on` does, so the
-  server behind only ever sees whole requests. It's held in memory,
-  where nginx would move a large one to a file.
+  endpoint only ever sees whole requests. It's held in memory, where
+  nginx would move a large one to a file.
 - `client_header_timeout` (60 s) for the whole head, and
   `client_body_timeout` (60 s) between two reads of the body; either
   gets `408`.
@@ -88,15 +106,16 @@ A request that matches no `location` gets `404`.
 
 - As the HTTP version `proxy_http_version` says: `1.0`, nginx's
   default, or `1.1`, which the shop's config sets. It opens a new
-  connection for each request, unless stage 5's `keepalive` has an
-  idle one.
+  connection for each request, unless stage 5's `keepalive_max_idle`
+  has an idle one.
 - With nginx's default headers, `Host: $proxy_host` (the host and port
   in `proxy_pass`) and `Connection: close`, and the client's others as
   they are. `proxy_set_header` adds or replaces one, and an empty value
   removes it. Its values can use `$host`, `$remote_addr`, `$proxy_host`,
-  `$proxy_add_x_forwarded_for`, and from stage 6, `$request_uri` (the
-  path and query as the client sent them), `$uri` (stage 2's normalised path) and
-  `$args` (the query). The shop's config sets `Host $host`
+  `$proxy_add_x_forwarded_for`, and from stage 6, `$path_and_query`
+  (as the client sent them; nginx's `$request_uri`), `$path` (stage 2's
+  normalised path; nginx's `$uri`) and `$query` (nginx's `$args`). The
+  shop's config sets `Host $host`
   and `X-Forwarded-For $proxy_add_x_forwarded_for`.
 - A refused connection gets `502`. `proxy_connect_timeout` (60 s) to
   connect, or `504`, and `proxy_send_timeout` (60 s) between two
@@ -112,8 +131,8 @@ A request that matches no `location` gets `404`.
 - As nginx's `proxy_buffering on`, it reads the reply as fast as the
   upstream sends it and sends it on as fast as the client takes it.
   What the client hasn't taken yet is held in memory, where nginx
-  would move it to a file. `send_timeout` (60 s) between two writes to
-  the client, then it closes.
+  would move it to a file. `client_send_timeout` (60 s; nginx's
+  `send_timeout`) between two writes to the client, then it closes.
 - A chunked reply (`Transfer-Encoding: chunked`, which a `1.1`
   upstream may send) goes to an HTTP/1.1 client as it came. An
   HTTP/1.0 client can't read chunks, so it gets them decoded, without
@@ -167,7 +186,7 @@ Each stage adds nginx's directives for it.
    /path` matches exactly and is checked first; otherwise the longest
    matching prefix wins. With a path in `proxy_pass`, the part of the
    URI that matched the location is replaced by it. As in nginx:
-   - Locations match the normalised path, nginx's `$uri`: `%XX`
+   - Locations match the normalised path, `$path`: `%XX`
      decoded, `//` merged, and `.` and `..` resolved, so
      `/search/../orders` is `/orders`. A path that climbs above `/`, a
      bad `%` escape or a `%00` gets `400`. The query isn't part of it.
@@ -177,7 +196,7 @@ Each stage adds nginx's directives for it.
      locations for it to stop. Two locations with the same match stop
      it starting: `duplicate location "/path"`.
    - With a path in `proxy_pass`, what's sent is that path, then the
-     rest of `$uri` after the location's own path (all of it, for
+     rest of `$path` after the location's own path (all of it, for
      `location =`), escaped again, then `?` and the query as it came.
      Without one, the URI goes on as the client sent it.
    - A prefix location that ends in `/` and has a `proxy_pass`, such as
@@ -207,25 +226,25 @@ Each stage adds nginx's directives for it.
      and the first keeps it. Two `default_server`s in a group stop it
      starting.
    - With no `Host`, `$host` is the server's first name.
-4. **Upstream pools:** `upstream name { server host:port; ... }`, and
+4. **Upstream pools:** `upstream name { host name:port; ... }`, and
    `proxy_pass http://name;`. As in nginx:
    - `proxy_pass` always sends to a pool. `http://127.0.0.1:8003` is
-     an unnamed one with that one server, shared by every `proxy_pass`
+     an unnamed one with that one host, shared by every `proxy_pass`
      that names it. A name is looked up once the whole file is read,
      so an `upstream` can come after the `proxy_pass` that uses it,
      and names are matched ignoring case. `$proxy_host` is what's
      written after `http://` in `proxy_pass`, up to any path: the
      pool's name, or the host and port.
-   - A host name that resolves to several addresses is one server per
-     address, in a pool's `server` or in `proxy_pass`.
+   - A name that resolves to several addresses is one endpoint per
+     address, in a pool's `host` or in `proxy_pass`.
    - Until stage 6 balances between them, every request goes to the
-     pool's first server.
+     pool's first endpoint.
    - These stop it starting: two pools with one name (`duplicate
-     upstream "x"`), a pool with no servers, a port after a pool's
-     name in `proxy_pass` (`upstream "x" may not have port 8080`), and
-     a `server` option other than the ones later stages add, which
-     say which stage until then.
-   - The error log's `upstream:` is the server's own address, such as
+     upstream "x"`), a pool with no hosts, a port after a pool's name
+     in `proxy_pass` (`upstream "x" may not have port 8080`), and a
+     `host` option other than the ones later stages add, which say
+     which stage until then.
+   - The error log's `upstream:` is the endpoint's address, such as
      `http://127.0.0.1:8003/search`.
 5. **Keep-alive:** as nginx's, with the client and with the upstream.
    With the client:
@@ -236,10 +255,11 @@ Each stage adds nginx's directives for it.
    - `keepalive_timeout` (75 s) in `http`, `server` or `location` is
      how long it waits for the next request, and `0` turns keep-alive
      off. A second argument, such as `keepalive_timeout 75s 60s`, adds
-     `Keep-Alive: timeout=60` to kept replies. `keepalive_requests`
-     (1000) and `keepalive_time` (1 h) make the reply that reaches that
-     many requests, or that long since the connection was accepted,
-     the last. `client_header_timeout` starts at the next request's
+     `Keep-Alive: timeout=60` to kept replies. `keepalive_max_requests`
+     (1000; nginx's `keepalive_requests`) and `keepalive_lifetime` (1 h;
+     nginx's `keepalive_time`) make the reply that reaches that many
+     requests, or that long since the connection was accepted, the
+     last. `client_header_timeout` starts at the next request's
      first byte.
    - Requests sent before the last reply came back (pipelined) are
      served in order.
@@ -260,14 +280,15 @@ Each stage adds nginx's directives for it.
      worker_connections are not enough, reusing connections`.
 
    With the upstream:
-   - `keepalive N;` in an `upstream` block keeps up to N idle
-     connections to its servers, closing the least recently used to
-     make room for another. It needs `proxy_http_version 1.1` and
-     `proxy_set_header Connection ""`, so the upstream isn't told to
-     close. A pool with no `keepalive`, such as a `proxy_pass` to an
-     address, closes each connection after its reply.
+   - `keepalive_max_idle N;` (nginx's `keepalive N`) in an `upstream`
+     block keeps up to N idle connections to its endpoints, closing the
+     least recently used to make room for another. It needs
+     `proxy_http_version 1.1` and `proxy_set_header Connection ""`, so
+     the upstream isn't told to close. A pool with no
+     `keepalive_max_idle`, such as a `proxy_pass` to an address, closes
+     each connection after its reply.
    - A request goes on the most recently idle connection to the
-     server chosen, or else a new one.
+     endpoint chosen, or else a new one.
    - A connection is kept once its whole reply is in: up to its
      `Content-Length` or last chunk, or with no body for `HEAD`, `1xx`,
      `204` and `304`. It isn't after an HTTP/1.0 reply, a reply with
@@ -278,68 +299,71 @@ Each stage adds nginx's directives for it.
      client's off, with `upstream prematurely closed connection while
      reading upstream`.
    - In the `upstream` block, `keepalive_timeout` (60 s) closes an idle
-     connection, and `keepalive_requests` (1000) and `keepalive_time`
-     (1 h) close one, instead of keeping it, after that many requests
-     or that long since it was opened. An idle one that turns readable,
-     as when the server closes it, is closed.
+     connection, and `keepalive_max_requests` (1000) and
+     `keepalive_lifetime` (1 h) close one, instead of keeping it, after
+     that many requests or that long since it was opened. An idle one
+     that turns readable, as when the endpoint closes it, is closed.
    - A request that fails with an error on a reused connection, before
      its reply's head is in, is sent again on another idle connection
-     or a new one, as the server may have closed it just as it was
+     or a new one, as the endpoint may have closed it just as it was
      reused. Never for `POST`, `PATCH` or `LOCK`, which get `502`, as
      they might have been acted on. Each failure is logged.
    - It needs tinyhttp's keep-alive, in `../tinyhttp/DESIGN.md`, whose
      idle time in the shop is longer, so tinyproxy always closes an
      idle connection first.
-6. **Load balancing:** as nginx's, a server is chosen for each request,
-   not each connection; then stage 5's `keepalive` looks for an idle
-   connection to it.
+6. **Load balancing:** as nginx's, an endpoint is chosen for each
+   request, not each connection; then stage 5's `keepalive_max_idle`
+   looks for an idle connection to it.
    - **Round robin**, the default, is nginx's smooth weighted round
-     robin. `weight=N` on a `server` (1 by default) is given to each of
-     its addresses. For each request every server's score goes up by
+     robin. `weight=N` on a `host` (1 by default) is given to each of
+     its endpoints. For each request every endpoint's score goes up by
      its weight, the highest is chosen (the first in the block on a
      tie), and its score goes down by the total of the weights, so
-     weights 5, 1 and 1 give `a a b a c a a`. A `proxy_pass` to a host
+     weights 5, 1 and 1 give `a a b a c a a`. A `proxy_pass` to a name
      with several addresses is balanced the same way.
-   - **`least_conn;`** chooses the server with the fewest active
-     connections for its weight, comparing `conns_a × weight_b` with
-     `conns_b × weight_a`, and round robin among those that tie. A
-     connection is active from when its server is chosen until its
-     reply is all in or it fails; idle kept ones don't count.
-   - **`ip_hash;`** keeps a client on one server: the first three parts
-     of its IPv4 address are hashed as nginx does, and the hash, modulo
-     the total weight, picks a server by weight.
+   - **`least_conn;`** chooses the endpoint with the fewest active
+     requests for its weight, comparing `active_a × weight_b` with
+     `active_b × weight_a`, and round robin among those that tie. A
+     request is active from when its endpoint is chosen until its
+     reply is all in or it fails; idle kept connections don't count.
+   - **`ip_hash;`** keeps a client on one endpoint: the first three
+     parts of its IPv4 address are hashed as nginx does, and the hash,
+     modulo the total weight, picks an endpoint by weight.
    - **`hash key;`** does the same with `key`, which can use the
-     variables `proxy_set_header` can, such as `$request_uri`, hashed with CRC32 as nginx's
-     (compatible with Cache::Memcached). **`hash key consistent;`** is
-     ketama consistent hashing, as nginx's (compatible with
-     Cache::Memcached::Fast): each server has 160 points per unit of
-     weight on a ring, and the key goes to the first point at or after
-     its hash, so adding or removing a server moves only its share of
-     keys.
-   - `down` on a `server` skips it for good, and `max_conns=N` skips it
-     while it has N active connections; idle kept ones don't count, so
-     with `keepalive` the total open can be more. A hash that lands on
-     one it can't use hashes again, and after 20 tries falls back to
-     round robin. With none left, the client gets `502`, and the error
-     log nginx's `no live upstreams while connecting to upstream`.
+     variables `proxy_set_header` can, such as `$path_and_query`,
+     hashed with CRC32 as nginx's (compatible with Cache::Memcached).
+     **`hash key consistent;`** is ketama consistent hashing, as
+     nginx's (compatible with Cache::Memcached::Fast): each host has
+     160 points per unit of weight on a ring, and the key goes to the
+     first point at or after its hash, so adding or removing a host
+     moves only its share of keys. Among a host's endpoints, round
+     robin picks one.
+   - `down` on a `host` skips its endpoints for good, and `max_conns=N`
+     skips each while it has N active requests; idle kept connections
+     don't count, so with `keepalive_max_idle` the total open can be
+     more. A hash that lands on one it can't use hashes again, and
+     after 20 tries falls back to round robin. With none left, the
+     client gets `502`, and the error log nginx's `no live upstreams
+     while connecting to upstream`.
    - These stop it starting: `weight=` that isn't a whole number from 1
      (`invalid parameter "weight=0"`), `max_conns=` that isn't a whole
      number, `hash` without a key or with anything but `consistent`
      after it, and `least_conn` or `ip_hash` with arguments.
    - As in nginx, a pool has one method, and a second gets `[warn] load
      balancing method redefined`, the last one winning. A method after
-     `keepalive` in the block also turns `keepalive` off for the pool,
+     `keepalive_max_idle` in the block also turns it off for the pool,
      with the same warning, as nginx's docs say to write the method
      first.
 7. **Passive health checks:** `max_fails` (1) and `fail_timeout`
-   (10 s) on a `server`: after `max_fails` failures within
-   `fail_timeout`, it's skipped for `fail_timeout`. With none left, the
-   client gets `502`. `backup` on a `server` keeps it for when every
-   other one is skipped or `down`, and stops it starting with `hash` or
-   `ip_hash`, as in nginx. Active checks are the gateway's.
+   (10 s) on a `host`: after `max_fails` failures within
+   `fail_timeout`, an endpoint is skipped for `fail_timeout`. With none
+   left, the client gets `502`. `backup` on a `host` keeps its
+   endpoints for when every other one is skipped or `down`, and stops
+   it starting with `hash` or `ip_hash`, as in nginx. Active checks are
+   the gateway's.
 8. **Phases:** hooks at nginx's phases, which the gateway's Python
    runs in, as OpenResty's `*_by_lua` directives do: access (allow it,
-   or answer here), balancer (pick the server), header filter, body
+   or answer here), balancer (pick the endpoint), header filter, body
    filter and log. `error_page` sends tinyproxy's own errors to a hook,
    as Kong's nginx config sends them to its Lua. The hooks run inside
    the loop, so, as in OpenResty, they must never block.
@@ -347,7 +371,7 @@ Each stage adds nginx's directives for it.
     `Cache-Control` and `Expires`.
 12. **Retries:** nginx's `proxy_next_upstream error timeout`: on a
     connection error or a timeout before any of the reply came back, it
-    tries the pool's next server. Never for `POST`, `PATCH` or `LOCK`,
+    tries the pool's next endpoint. Never for `POST`, `PATCH` or `LOCK`,
     as they might have been acted on.
 13. **Observability:** the access log, and nginx's `stub_status`: a
     page of active connections, connections accepted and handled,
@@ -365,7 +389,7 @@ Stages 9 and 10 are the gateway's.
 - One `access_log` per block; nginx can write to several.
 - No `random` balancing method, nginx's `random` and `random two`.
 - No `$cookie_<name>` or `$http_<name>` variables, so `hash` can't keep a
-  session on one server. The shop has no sessions: its JWT is sent with
+  session on one endpoint. The shop has no sessions: its JWT is sent with
   every request, and any service can answer any request.
 - No `keepalive_disable`, which turns keep-alive off for old browsers,
   or `chunked_transfer_encoding off`.

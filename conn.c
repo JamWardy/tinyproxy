@@ -32,7 +32,7 @@ static int would_block(int error_number) {
            error_number == EINTR;
 }
 
-static int has_upstream(ConnState state) {
+static int uses_upstream(ConnState state) {
     switch (state) {
         case CONN_CONNECTING:
         case CONN_SENDING_REQUEST:
@@ -43,10 +43,10 @@ static int has_upstream(ConnState state) {
         case CONN_READING_HEAD:
         case CONN_READING_BODY:
         case CONN_SENDING_REPLY:
-        case CONN_SENDING_ERROR:
+        case CONN_SENDING_OWN_REPLY:
         case CONN_LINGERING:
         case CONN_DISCARDING_BODY:
-        case CONN_KEEPALIVE:
+        case CONN_IDLE:
             return 0;
     }
     return 0;
@@ -59,20 +59,21 @@ static void close_upstream(Connection *conn) {
     }
 }
 
-// Moves to state. Leaving the upstream's states ends the server's active
-// connection, and closes it if it wasn't kept.
-static void enter(Connection *conn, ConnState state) {
-    if (has_upstream(conn->state) && !has_upstream(state) && conn->peer) {
-        release_peer(conn->location->proxy_pass.upstream, conn->peer);
+// Moves to state. Leaving the upstream's states ends the endpoint's active
+// request, and closes the upstream connection if it wasn't kept.
+static void set_state(Connection *conn, ConnState state) {
+    if (uses_upstream(conn->state) && !uses_upstream(state) &&
+        conn->endpoint) {
+        release_endpoint(conn->location->proxy_pass.upstream, conn->endpoint);
     }
-    if (!has_upstream(state)) {
+    if (!uses_upstream(state)) {
         close_upstream(conn);
     }
     conn->state = state;
 }
 
-static void release(Connection *conn) {
-    enter(conn, CONN_UNUSED);
+static void close_conn(Connection *conn) {
+    set_state(conn, CONN_UNUSED);
     close(conn->client_fd);
     buffer_free(&conn->from_client);
     buffer_free(&conn->upstream_uri);
@@ -83,7 +84,7 @@ static void release(Connection *conn) {
 }
 
 void conn_close(Connection *conn) {
-    release(conn);
+    close_conn(conn);
 }
 
 // ---- Logs ----
@@ -99,9 +100,10 @@ static void log_request(const Connection *conn) {
     entry.time = time(NULL);
     entry.request_line = conn->request.line;
     entry.status = conn->status;
-    entry.body_bytes_sent = conn->sent > conn->reply_head_length
-                                ? conn->sent - conn->reply_head_length
-                                : 0;
+    entry.body_bytes_sent =
+        conn->sent_to_client > conn->reply_head_length
+            ? conn->sent_to_client - conn->reply_head_length
+            : 0;
     entry.referer = request_find_header(&conn->request, "Referer");
     entry.user_agent = request_find_header(&conn->request, "User-Agent");
     access_log_write(log->fd, &entry);
@@ -121,25 +123,25 @@ static void log_conn(const Connection *conn, const char *level,
     vsnprintf(message, sizeof(message), format, args);
     va_end(args);
 
-    // As nginx's, there's an upstream only once a server's been chosen.
+    // As nginx's, there's an upstream only once an endpoint's been chosen.
     char upstream[1024] = "";
-    if (conn->peer) {
+    if (conn->endpoint) {
         snprintf(upstream, sizeof(upstream), ", upstream: \"http://%s%s\"",
-                 conn->peer->text, buffer_bytes(&conn->upstream_uri));
+                 conn->endpoint->text, buffer_bytes(&conn->upstream_uri));
     }
 
     const Request *request = &conn->request;
     error_log(level,
               "*%llu %s, client: %s, request: \"%s\"%s, host: \"%s\"",
-              conn->number, message, conn->remote_addr,
+              conn->id, message, conn->remote_addr,
               request->line ? request->line : "", upstream,
               request->host ? request->host : "");
 }
 
 // The request has its answer, or never will: logs it, and closes.
-static void finish(Connection *conn) {
+static void log_and_close(Connection *conn) {
     log_request(conn);
-    release(conn);
+    close_conn(conn);
 }
 
 // ---- Reading and writing ----
@@ -172,18 +174,18 @@ static Received receive(int fd, Buffer *into, int *error_number) {
 // ---- Keeping the client's connection ----
 
 // nginx's checks once the request has its location, before anything about
-// the reply: the client asked, and keepalive_timeout, keepalive_requests and
-// keepalive_time allow it.
+// the reply: the client asked, and keepalive_timeout,
+// keepalive_max_requests and keepalive_lifetime allow it.
 static int may_keep_client(const Connection *conn, double now) {
     const Settings *settings = conn->settings;
 
-    return conn->request.keepalive && settings->keepalive_timeout > 0 &&
-           conn->requests < settings->keepalive_requests &&
-           now - conn->accepted_at <= settings->keepalive_time;
+    return conn->request.wants_keepalive && settings->keepalive_timeout > 0 &&
+           conn->request_count < settings->keepalive_max_requests &&
+           now - conn->accepted_at <= settings->keepalive_lifetime;
 }
 
 // tinyproxy's own replies that keep it, as nginx's do.
-static int own_reply_keeps(int status) {
+static int own_reply_keeps_client(int status) {
     switch (status) {
         case 400:
         case 408:
@@ -198,12 +200,12 @@ static int own_reply_keeps(int status) {
     }
 }
 
-// The Connection header lines for the reply, as conn->keepalive says.
-static void connection_lines(const Connection *conn, char *out,
-                             size_t size) {
+// The Connection header lines for the reply, as conn->keep_client says.
+static void connection_headers(const Connection *conn, char *out,
+                               size_t size) {
     const OptionalSeconds *header = &conn->settings->keepalive_header_timeout;
 
-    if (!conn->keepalive) {
+    if (!conn->keep_client) {
         snprintf(out, size, "Connection: close\r\n");
     } else if (header->is_set) {
         snprintf(out, size,
@@ -226,37 +228,37 @@ static int has_more_requests(const Connection *conn) {
                conn->head_length + conn->request.content_length;
 }
 
-static void take_head(Connection *conn, double now);
+static void handle_head(Connection *conn, double now);
 
 // Starts a request on the connection, from the group's default server.
-static void begin_request(Connection *conn, double now) {
+static void reset_for_request(Connection *conn, double now) {
     conn->server = conn->group->default_server;
     conn->settings = &conn->server->settings;
     conn->location = NULL;
-    conn->peer = NULL;
+    conn->endpoint = NULL;
     conn->head_length = 0;
     conn->pipelined = 0;
-    conn->discarding = 0;
-    conn->reply_body = REPLY_BODY_AS_IS;
-    conn->keepalive = 0;
+    conn->discard_left = 0;
+    conn->body_rewrite = REWRITE_NONE;
+    conn->keep_client = 0;
     conn->status = 0;
     conn->reply_head_length = 0;
-    conn->sent = 0;
-    conn->requests++;
+    conn->sent_to_client = 0;
+    conn->request_count++;
     conn->request_at = now;
     conn->client_io_at = now;
-    enter(conn, CONN_READING_HEAD);
+    set_state(conn, CONN_READING_HEAD);
 }
 
 // Reads the next request if it's already been sent, or else waits for it.
 static void wait_for_request(Connection *conn, double now) {
     if (buffer_length(&conn->from_client) > 0) {
-        begin_request(conn, now);
-        take_head(conn, now);
+        reset_for_request(conn, now);
+        handle_head(conn, now);
         return;
     }
     conn->client_io_at = now;
-    enter(conn, CONN_KEEPALIVE);
+    set_state(conn, CONN_IDLE);
 }
 
 // The request's done and the connection kept: drops the request, then the
@@ -272,10 +274,10 @@ static void next_request(Connection *conn, double now) {
     buffer_clear(&conn->to_upstream);
     buffer_clear(&conn->from_upstream);
     if (used > have) {
-        conn->discarding = used - have;
+        conn->discard_left = used - have;
         conn->lingering_since = now;
         conn->client_io_at = now;
-        enter(conn, CONN_DISCARDING_BODY);
+        set_state(conn, CONN_DISCARDING_BODY);
         return;
     }
     wait_for_request(conn, now);
@@ -288,17 +290,18 @@ static void start_lingering(Connection *conn, double now) {
     shutdown(conn->client_fd, SHUT_WR);
     conn->lingering_since = now;
     conn->client_io_at = now;
-    enter(conn, CONN_LINGERING);
+    set_state(conn, CONN_LINGERING);
 }
 
 // The whole reply has gone to the client.
 static void reply_sent(Connection *conn, double now) {
-    if (conn->keepalive) {
+    if (conn->keep_client) {
         next_request(conn, now);
-    } else if (conn->state == CONN_SENDING_ERROR || has_more_requests(conn)) {
+    } else if (conn->state == CONN_SENDING_OWN_REPLY ||
+               has_more_requests(conn)) {
         start_lingering(conn, now);
     } else {
-        finish(conn);
+        log_and_close(conn);
     }
 }
 
@@ -306,19 +309,20 @@ static void reply_sent(Connection *conn, double now) {
 
 // tinyproxy's own reply in place of anything else, closing the upstream
 // connection if there is one. redirect is a 301's Location, or NULL.
-static void reply_own(Connection *conn, int status, const char *redirect,
-                      double now) {
+static void send_own_reply(Connection *conn, int status, const char *redirect,
+                           double now) {
     const char *method = conn->request.method;
     int with_body = !(method && strcmp(method, "HEAD") == 0);
     char connection[80];
 
-    enter(conn, CONN_SENDING_ERROR);
-    conn->keepalive = own_reply_keeps(status) && may_keep_client(conn, now);
-    connection_lines(conn, connection, sizeof(connection));
+    set_state(conn, CONN_SENDING_OWN_REPLY);
+    conn->keep_client =
+        own_reply_keeps_client(status) && may_keep_client(conn, now);
+    connection_headers(conn, connection, sizeof(connection));
     buffer_clear(&conn->to_client);
-    if (!build_error_reply(&conn->to_client, status, with_body, redirect,
-                           connection)) {
-        release(conn);
+    if (!build_own_reply(&conn->to_client, status, with_body, redirect,
+                         connection)) {
+        close_conn(conn);
         return;
     }
     conn->status = status == STATUS_HEADER_TOO_LARGE ? 400 : status;
@@ -327,7 +331,7 @@ static void reply_own(Connection *conn, int status, const char *redirect,
     // The body will be dropped once this is sent, so a client waiting to
     // be told to send it is told, as nginx does. Short and the first thing
     // sent, the socket always takes it whole.
-    if (conn->keepalive && !body_received(conn) &&
+    if (conn->keep_client && !body_received(conn) &&
         conn->request.expects_continue) {
         static const char CONTINUE[] = "HTTP/1.1 100 Continue\r\n\r\n";
         (void)send(conn->client_fd, CONTINUE, sizeof(CONTINUE) - 1, 0);
@@ -335,8 +339,8 @@ static void reply_own(Connection *conn, int status, const char *redirect,
     conn->client_io_at = now;
 }
 
-static void reply_error(Connection *conn, int status, double now) {
-    reply_own(conn, status, NULL, now);
+static void send_error(Connection *conn, int status, double now) {
+    send_own_reply(conn, status, NULL, now);
 }
 
 static void log_upstream_error(const Connection *conn, int error_number,
@@ -350,11 +354,11 @@ static void log_upstream_error(const Connection *conn, int error_number,
 }
 
 // Something went wrong upstream before the reply's head was in.
-static void upstream_failed(Connection *conn, int status, int error_number,
-                            const char *what, const char *doing,
-                            double now) {
+static void fail_upstream(Connection *conn, int status, int error_number,
+                          const char *what, const char *doing,
+                          double now) {
     log_upstream_error(conn, error_number, what, doing);
-    reply_error(conn, status, now);
+    send_error(conn, status, now);
 }
 
 static void send_to_client(Connection *conn, double now) {
@@ -367,15 +371,15 @@ static void send_to_client(Connection *conn, double now) {
                          buffer_length(out), 0);
     if (count < 0) {
         if (!would_block(errno)) {
-            finish(conn);  // The client has gone.
+            log_and_close(conn);  // The client has gone.
         }
         return;
     }
     buffer_consume(out, (size_t)count);
-    conn->sent += (size_t)count;
+    conn->sent_to_client += (size_t)count;
     conn->client_io_at = now;
     if (buffer_length(out) == 0 && (conn->state == CONN_SENDING_REPLY ||
-                                    conn->state == CONN_SENDING_ERROR)) {
+                                    conn->state == CONN_SENDING_OWN_REPLY)) {
         reply_sent(conn, now);
     }
 }
@@ -412,8 +416,8 @@ static int build_redirect(const Connection *conn, const Location *location,
     return buffer_appendf(out, "http://%s", host) &&
            (port == 80 || buffer_appendf(out, ":%u", port)) &&
            buffer_append_text(out, location->path) &&
-           (!request->args || !*request->args ||
-            buffer_appendf(out, "?%s", request->args)) &&
+           (!request->query || !*request->query ||
+            buffer_appendf(out, "?%s", request->query)) &&
            buffer_append(out, "", 1);
 }
 
@@ -423,9 +427,9 @@ static void reply_redirect(Connection *conn, const Location *location,
 
     buffer_init(&url);
     if (build_redirect(conn, location, &url)) {
-        reply_own(conn, 301, buffer_bytes(&url), now);
+        send_own_reply(conn, 301, buffer_bytes(&url), now);
     } else {
-        reply_error(conn, 500, now);
+        send_error(conn, 500, now);
     }
     buffer_free(&url);
 }
@@ -457,9 +461,9 @@ static int fill_variables(const Connection *conn, Buffer *forwarded,
     variables->remote_addr = conn->remote_addr;
     variables->proxy_host = conn->location->proxy_pass.host;
     variables->proxy_add_x_forwarded_for = buffer_bytes(forwarded);
-    variables->request_uri = request->path;
-    variables->uri = request->uri;
-    variables->args = request->args ? request->args : "";
+    variables->path_and_query = request->path_and_query;
+    variables->path = request->path;
+    variables->query = request->query ? request->query : "";
     return 1;
 }
 
@@ -467,7 +471,7 @@ static int fill_variables(const Connection *conn, Buffer *forwarded,
 // Fails only when out of memory.
 static int build_request(Connection *conn, Buffer *key) {
     const Location *location = conn->location;
-    const char *key_template = location->proxy_pass.upstream->balance.key;
+    const char *key_template = location->proxy_pass.upstream->method.key;
     Buffer forwarded;
     Variables variables;
 
@@ -486,7 +490,7 @@ static int build_request(Connection *conn, Buffer *key) {
     return ok;
 }
 
-// Sends the request on an idle connection to the server chosen, or else a
+// Sends the request on an idle connection to the endpoint chosen, or else a
 // new one.
 static void connect_upstream(Connection *conn, double now) {
     const char *connecting = "connecting to upstream";
@@ -496,46 +500,47 @@ static void connect_upstream(Connection *conn, double now) {
     buffer_init(&key);
     int ok = build_request(conn, &key);
     if (ok) {
-        conn->peer = choose_peer(upstream, conn->remote, buffer_bytes(&key),
-                                 buffer_length(&key));
+        conn->endpoint = choose_endpoint(upstream, conn->remote_ip,
+                                         buffer_bytes(&key),
+                                         buffer_length(&key));
     }
     buffer_free(&key);
     if (!ok) {
-        reply_error(conn, 500, now);
+        send_error(conn, 500, now);
         return;
     }
-    if (!conn->peer) {
-        upstream_failed(conn, 502, 0, "no live upstreams", connecting, now);
+    if (!conn->endpoint) {
+        fail_upstream(conn, 502, 0, "no live upstreams", connecting, now);
         return;
     }
     conn->upstream_io_at = now;
-    enter(conn, CONN_CONNECTING);
-    if (keepalive_take(upstream, conn->peer, &conn->upstream)) {
+    set_state(conn, CONN_CONNECTING);
+    if (keepalive_take(upstream, conn->endpoint, &conn->upstream)) {
         conn->upstream.requests++;
-        enter(conn, CONN_SENDING_REQUEST);
+        set_state(conn, CONN_SENDING_REQUEST);
         return;
     }
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
-        upstream_failed(conn, 502, errno, "socket() failed", connecting, now);
+        fail_upstream(conn, 502, errno, "socket() failed", connecting, now);
         return;
     }
     if (fd >= FD_SETSIZE || !set_non_blocking(fd)) {
         close(fd);
-        upstream_failed(conn, 502, 0, "no descriptor select() can watch",
-                        connecting, now);
+        fail_upstream(conn, 502, 0, "no descriptor select() can watch",
+                      connecting, now);
         return;
     }
 
     conn->upstream.fd = fd;
     conn->upstream.requests = 1;
     conn->upstream.opened_at = now;
-    const struct sockaddr_in *address = &conn->peer->address;
+    const struct sockaddr_in *address = &conn->endpoint->address;
     if (connect(fd, (const struct sockaddr *)address, sizeof(*address)) == 0) {
-        enter(conn, CONN_SENDING_REQUEST);
+        set_state(conn, CONN_SENDING_REQUEST);
     } else if (errno != EINPROGRESS) {
-        upstream_failed(conn, 502, errno, "connect() failed", connecting, now);
+        fail_upstream(conn, 502, errno, "connect() failed", connecting, now);
     }
 }
 
@@ -546,31 +551,32 @@ static int is_idempotent(const char *method) {
 }
 
 // An error on the upstream connection before the reply's head was in. On a
-// reused connection the server may have closed it just as it was taken, so
+// reused connection the endpoint may have closed it just as it was taken, so
 // the request is sent again, if that's safe.
-static void upstream_error(Connection *conn, int error_number,
-                           const char *what, const char *doing, double now) {
+static void retry_or_fail_upstream(Connection *conn, int error_number,
+                                   const char *what, const char *doing,
+                                   double now) {
     if (conn->upstream.requests == 1 ||
         !is_idempotent(conn->request.method)) {
-        upstream_failed(conn, 502, error_number, what, doing, now);
+        fail_upstream(conn, 502, error_number, what, doing, now);
         return;
     }
     log_upstream_error(conn, error_number, what, doing);
     close_upstream(conn);
-    release_peer(conn->location->proxy_pass.upstream, conn->peer);
-    conn->peer = NULL;
+    release_endpoint(conn->location->proxy_pass.upstream, conn->endpoint);
+    conn->endpoint = NULL;
     buffer_clear(&conn->from_upstream);
     connect_upstream(conn, now);
 }
 
-static void start_request(Connection *conn, double now) {
+static void route_request(Connection *conn, double now) {
     conn->server = find_server(conn->group, conn->request.host);
     conn->settings = &conn->server->settings;
 
-    Route route = find_route(conn->server, conn->request.uri);
+    Route route = find_route(conn->server, conn->request.path);
 
     if (route.kind == ROUTE_NONE) {
-        reply_error(conn, 404, now);
+        send_error(conn, 404, now);
         return;
     }
     const Location *location = route.location;
@@ -581,14 +587,14 @@ static void start_request(Connection *conn, double now) {
         return;
     }
     if (!location->has_proxy_pass) {
-        reply_error(conn, 404, now);
+        send_error(conn, 404, now);
         return;
     }
     // Built now, so the error log can show it from here on. The NUL makes
     // its bytes a string.
     if (!build_upstream_uri(&conn->upstream_uri, &conn->request, location) ||
         !buffer_append(&conn->upstream_uri, "", 1)) {
-        reply_error(conn, 500, now);
+        send_error(conn, 500, now);
         return;
     }
 
@@ -596,7 +602,7 @@ static void start_request(Connection *conn, double now) {
     if (limit > 0 && conn->request.content_length > limit) {
         log_conn(conn, "error", "client intended to send too large body: "
                                 "%zu bytes", conn->request.content_length);
-        reply_error(conn, 413, now);
+        send_error(conn, 413, now);
         return;
     }
 
@@ -611,18 +617,18 @@ static void start_request(Connection *conn, double now) {
         (void)send(conn->client_fd, CONTINUE, sizeof(CONTINUE) - 1, 0);
     }
     conn->client_io_at = now;
-    enter(conn, CONN_READING_BODY);
+    set_state(conn, CONN_READING_BODY);
 }
 
 // Acts on the head in from_client, once it's all in.
-static void take_head(Connection *conn, double now) {
+static void handle_head(Connection *conn, double now) {
     HeadScan scan = scan_request_head(buffer_bytes(&conn->from_client),
                                       buffer_length(&conn->from_client));
     switch (scan.state) {
         case HEAD_INCOMPLETE:
             return;
         case HEAD_REJECTED:
-            reply_error(conn, scan.status, now);
+            send_error(conn, scan.status, now);
             return;
         case HEAD_COMPLETE:
             break;
@@ -632,10 +638,10 @@ static void take_head(Connection *conn, double now) {
     int status = request_parse(&conn->request,
                                buffer_bytes(&conn->from_client), scan.length);
     if (status) {
-        reply_error(conn, status, now);
+        send_error(conn, status, now);
         return;
     }
-    start_request(conn, now);
+    route_request(conn, now);
 }
 
 static void read_head(Connection *conn, double now) {
@@ -646,12 +652,12 @@ static void read_head(Connection *conn, double now) {
             return;
         case RECEIVED_END:
         case RECEIVED_ERROR:
-            release(conn);  // Gone before asking anything.
+            close_conn(conn);  // Gone before asking anything.
             return;
         case RECEIVED_DATA:
             break;
     }
-    take_head(conn, now);
+    handle_head(conn, now);
 }
 
 static void read_body(Connection *conn, double now) {
@@ -662,7 +668,7 @@ static void read_body(Connection *conn, double now) {
             return;
         case RECEIVED_END:
         case RECEIVED_ERROR:
-            release(conn);
+            close_conn(conn);
             return;
         case RECEIVED_DATA:
             break;
@@ -687,7 +693,7 @@ static void check_client_closed(Connection *conn) {
         case RECEIVED_END:
         case RECEIVED_ERROR:
             conn->status = STATUS_CLIENT_CLOSED;
-            finish(conn);
+            log_and_close(conn);
             return;
     }
 }
@@ -703,7 +709,7 @@ static void linger(Connection *conn, double now) {
             return;
         case RECEIVED_END:
         case RECEIVED_ERROR:
-            release(conn);
+            close_conn(conn);
             return;
     }
 }
@@ -716,24 +722,24 @@ static void discard_body(Connection *conn, double now) {
             return;
         case RECEIVED_END:
         case RECEIVED_ERROR:
-            release(conn);
+            close_conn(conn);
             return;
         case RECEIVED_DATA:
             break;
     }
     size_t have = buffer_length(&conn->from_client);
-    size_t dropped = have < conn->discarding ? have : conn->discarding;
+    size_t dropped = have < conn->discard_left ? have : conn->discard_left;
 
     buffer_consume(&conn->from_client, dropped);
-    conn->discarding -= dropped;
+    conn->discard_left -= dropped;
     conn->client_io_at = now;
-    if (conn->discarding == 0) {
+    if (conn->discard_left == 0) {
         wait_for_request(conn, now);
     }
 }
 
 // An idle connection that turned readable: the next request, or the close.
-static void wake(Connection *conn, double now) {
+static void read_idle(Connection *conn, double now) {
     int error_number;
 
     switch (receive(conn->client_fd, &conn->from_client, &error_number)) {
@@ -741,11 +747,11 @@ static void wake(Connection *conn, double now) {
             return;
         case RECEIVED_END:
         case RECEIVED_ERROR:
-            release(conn);
+            close_conn(conn);
             return;
         case RECEIVED_DATA:
-            begin_request(conn, now);
-            take_head(conn, now);
+            reset_for_request(conn, now);
+            handle_head(conn, now);
             return;
     }
 }
@@ -759,15 +765,15 @@ static void send_request(Connection *conn, double now) {
 
     if (count < 0) {
         if (!would_block(errno)) {
-            upstream_error(conn, errno, "send() failed",
-                           "sending request to upstream", now);
+            retry_or_fail_upstream(conn, errno, "send() failed",
+                                   "sending request to upstream", now);
         }
         return;
     }
     buffer_consume(out, (size_t)count);
     conn->upstream_io_at = now;
     if (buffer_length(out) == 0) {
-        enter(conn, CONN_READING_REPLY_HEAD);
+        set_state(conn, CONN_READING_REPLY_HEAD);
     }
 }
 
@@ -780,37 +786,37 @@ static void finish_connecting(Connection *conn, double now) {
         error_number = errno;
     }
     if (error_number) {
-        upstream_failed(conn, 502, error_number, "connect() failed",
-                        "connecting to upstream", now);
+        fail_upstream(conn, 502, error_number, "connect() failed",
+                      "connecting to upstream", now);
         return;
     }
     conn->upstream_io_at = now;
-    enter(conn, CONN_SENDING_REQUEST);
+    set_state(conn, CONN_SENDING_REQUEST);
     send_request(conn, now);
 }
 
 // How the body goes to this client: chunks it can't read are decoded, and
 // a body with no length of its own is chunked for one that can.
-static ReplyBody client_body(const Connection *conn) {
+static BodyRewrite choose_body_rewrite(const Connection *conn) {
     int reads_chunks = conn->request.version >= HTTP_1_1;
 
     switch (conn->reply.framing) {
         case REPLY_NO_BODY:
         case REPLY_LENGTH:
-            return REPLY_BODY_AS_IS;
+            return REWRITE_NONE;
         case REPLY_CHUNKED:
-            return reads_chunks ? REPLY_BODY_AS_IS : REPLY_BODY_DECODED;
+            return reads_chunks ? REWRITE_NONE : REWRITE_DECHUNK;
         case REPLY_UNTIL_CLOSE:
-            return reads_chunks ? REPLY_BODY_ENCODED : REPLY_BODY_AS_IS;
+            return reads_chunks ? REWRITE_CHUNK : REWRITE_NONE;
     }
-    return REPLY_BODY_AS_IS;
+    return REWRITE_NONE;
 }
 
 // The client can find the end of the body without the close.
 static int client_finds_end(const Connection *conn) {
-    return conn->reply_body != REPLY_BODY_DECODED &&
+    return conn->body_rewrite != REWRITE_DECHUNK &&
            !(conn->reply.framing == REPLY_UNTIL_CLOSE &&
-             conn->reply_body == REPLY_BODY_AS_IS);
+             conn->body_rewrite == REWRITE_NONE);
 }
 
 typedef enum {
@@ -822,8 +828,8 @@ typedef enum {
 
 // Adds a piece of the reply's body to what goes to the client. *used says
 // how much of the piece was the body's.
-static BodyResult take_body(Connection *conn, const char *data, size_t size,
-                            size_t *used) {
+static BodyResult pass_on_body(Connection *conn, const char *data, size_t size,
+                               size_t *used) {
     Buffer *out = &conn->to_client;
 
     *used = 0;
@@ -843,7 +849,7 @@ static BodyResult take_body(Connection *conn, const char *data, size_t size,
         case REPLY_CHUNKED: {
             // Passed on as they came, the chunks are decoded only to find
             // their end.
-            int decoded = conn->reply_body == REPLY_BODY_DECODED;
+            int decoded = conn->body_rewrite == REWRITE_DECHUNK;
 
             switch (chunk_decode(&conn->chunks, data, size,
                                  decoded ? out : NULL, used)) {
@@ -860,7 +866,7 @@ static BodyResult take_body(Connection *conn, const char *data, size_t size,
             return conn->chunks.state == CHUNK_DONE ? BODY_DONE : BODY_MORE;
         }
         case REPLY_UNTIL_CLOSE: {
-            int ok = conn->reply_body == REPLY_BODY_ENCODED
+            int ok = conn->body_rewrite == REWRITE_CHUNK
                          ? chunk_encode(out, data, size)
                          : buffer_append(out, data, size);
 
@@ -873,7 +879,7 @@ static BodyResult take_body(Connection *conn, const char *data, size_t size,
 
 // What the upstream sent past the reply, which is dropped, and keeps its
 // connection from being reused.
-static void log_extra(const Connection *conn) {
+static void log_extra_data(const Connection *conn) {
     log_conn(conn, "warn", conn->reply.framing == REPLY_CHUNKED
                                ? "upstream sent data after final chunk"
                                : "upstream sent more data than specified "
@@ -882,13 +888,13 @@ static void log_extra(const Connection *conn) {
 
 // The upstream's reply is all in: keeps its connection if it can, then
 // sends the client what's left.
-static void reply_in(Connection *conn, int reusable, double now) {
-    if (reusable && conn->reply.upstream_keeps) {
-        keepalive_keep(conn->location->proxy_pass.upstream, conn->peer,
+static void upstream_reply_done(Connection *conn, int reusable, double now) {
+    if (reusable && conn->reply.upstream_reusable) {
+        keepalive_keep(conn->location->proxy_pass.upstream, conn->endpoint,
                        &conn->upstream, now);
         conn->upstream.fd = -1;
     }
-    enter(conn, CONN_SENDING_REPLY);
+    set_state(conn, CONN_SENDING_REPLY);
     if (buffer_length(&conn->to_client) == 0) {
         reply_sent(conn, now);
     }
@@ -903,11 +909,13 @@ static void read_reply_head(Connection *conn, double now) {
         case RECEIVED_NOTHING:
             return;
         case RECEIVED_END:
-            upstream_error(conn, 0, "upstream prematurely closed connection",
-                           reading, now);
+            retry_or_fail_upstream(conn, 0,
+                                   "upstream prematurely closed connection",
+                                   reading, now);
             return;
         case RECEIVED_ERROR:
-            upstream_error(conn, error_number, "recv() failed", reading, now);
+            retry_or_fail_upstream(conn, error_number, "recv() failed",
+                                   reading, now);
             return;
         case RECEIVED_DATA:
             break;
@@ -917,8 +925,8 @@ static void read_reply_head(Connection *conn, double now) {
     size_t head = find_reply_head(buffer_bytes(in), buffer_length(in));
     if (head == 0 ? buffer_length(in) > REPLY_HEAD_LIMIT
                   : head > REPLY_HEAD_LIMIT) {
-        upstream_failed(conn, 502, 0, "upstream sent too big header",
-                        reading, now);
+        fail_upstream(conn, 502, 0, "upstream sent too big header",
+                      reading, now);
         return;
     }
     if (head == 0) {
@@ -929,18 +937,18 @@ static void read_reply_head(Connection *conn, double now) {
     int status = parse_reply_head(buffer_bytes(in), head, to_head,
                                   &conn->reply);
     if (status) {
-        upstream_failed(conn, status, 0, "upstream sent invalid header",
-                        reading, now);
+        fail_upstream(conn, status, 0, "upstream sent invalid header",
+                      reading, now);
         return;
     }
     char connection[80];
     conn->status = conn->reply.status;
-    conn->reply_body = client_body(conn);
-    conn->keepalive = may_keep_client(conn, now) && client_finds_end(conn);
-    connection_lines(conn, connection, sizeof(connection));
+    conn->body_rewrite = choose_body_rewrite(conn);
+    conn->keep_client = may_keep_client(conn, now) && client_finds_end(conn);
+    connection_headers(conn, connection, sizeof(connection));
     if (!write_reply_head(&conn->to_client, buffer_bytes(in), head,
-                          conn->reply_body, connection)) {
-        reply_error(conn, 500, now);
+                          conn->body_rewrite, connection)) {
+        send_error(conn, 500, now);
         return;
     }
     conn->reply_head_length = buffer_length(&conn->to_client);
@@ -949,28 +957,28 @@ static void read_reply_head(Connection *conn, double now) {
     // Nothing has gone to the client yet, so a failure can still be answered.
     size_t used;
     buffer_consume(in, head);
-    BodyResult result = take_body(conn, buffer_bytes(in), buffer_length(in),
-                                  &used);
+    BodyResult result = pass_on_body(conn, buffer_bytes(in), buffer_length(in),
+                                     &used);
     size_t extra = buffer_length(in) - used;
     buffer_clear(in);
     conn->client_io_at = now;
     switch (result) {
         case BODY_MORE:
-            enter(conn, CONN_READING_REPLY);
+            set_state(conn, CONN_READING_REPLY);
             return;
         case BODY_DONE:
             if (extra) {
-                log_extra(conn);
+                log_extra_data(conn);
             }
-            reply_in(conn, extra == 0, now);
+            upstream_reply_done(conn, extra == 0, now);
             return;
         case BODY_INVALID:
-            upstream_failed(conn, 502, 0,
-                            "upstream sent invalid chunked response",
-                            reading, now);
+            fail_upstream(conn, 502, 0,
+                          "upstream sent invalid chunked response",
+                          reading, now);
             return;
         case BODY_OUT_OF_MEMORY:
-            reply_error(conn, 500, now);
+            send_error(conn, 500, now);
             return;
     }
 }
@@ -990,25 +998,25 @@ static void read_reply(Connection *conn, double now) {
             if (conn->reply.framing != REPLY_UNTIL_CLOSE) {
                 log_conn(conn, "error", "upstream prematurely closed "
                                         "connection while reading upstream");
-                finish(conn);
-            } else if (conn->reply_body == REPLY_BODY_ENCODED &&
+                log_and_close(conn);
+            } else if (conn->body_rewrite == REWRITE_CHUNK &&
                        !chunk_encode_end(&conn->to_client)) {
-                finish(conn);
+                log_and_close(conn);
             } else {
-                reply_in(conn, 0, now);
+                upstream_reply_done(conn, 0, now);
             }
             return;
         case RECEIVED_ERROR:
             log_conn(conn, "error", "recv() failed (%d: %s) while reading "
                                     "upstream", error_number,
                      strerror(error_number));
-            finish(conn);
+            log_and_close(conn);
             return;
     }
 
     size_t used;
-    BodyResult result = take_body(conn, buffer_bytes(in), buffer_length(in),
-                                  &used);
+    BodyResult result = pass_on_body(conn, buffer_bytes(in), buffer_length(in),
+                                     &used);
     size_t extra = buffer_length(in) - used;
     buffer_clear(in);
     switch (result) {
@@ -1016,36 +1024,36 @@ static void read_reply(Connection *conn, double now) {
             break;
         case BODY_DONE:
             if (extra) {
-                log_extra(conn);
+                log_extra_data(conn);
             }
-            reply_in(conn, extra == 0, now);
+            upstream_reply_done(conn, extra == 0, now);
             return;
         case BODY_INVALID:
             log_conn(conn, "error", "upstream sent invalid chunked response "
                                     "while reading upstream");
-            finish(conn);
+            log_and_close(conn);
             return;
         case BODY_OUT_OF_MEMORY:
-            finish(conn);
+            log_and_close(conn);
             return;
     }
     conn->upstream_io_at = now;
     if (was_empty && buffer_length(&conn->to_client) > 0) {
-        conn->client_io_at = now;  // send_timeout starts now.
+        conn->client_io_at = now;  // client_send_timeout starts now.
     }
 }
 
 // ---- The loop's side ----
 
-void conn_start(Connection *conn, int fd, const struct sockaddr_in *peer,
+void conn_start(Connection *conn, int fd, const struct sockaddr_in *client,
                 const AddressGroup *group, double now) {
-    conn->number = ++connections_accepted;
+    conn->id = ++connections_accepted;
     conn->client_fd = fd;
     conn->upstream.fd = -1;
-    conn->remote = peer->sin_addr;
-    inet_ntop(AF_INET, &peer->sin_addr, conn->remote_addr,
+    conn->remote_ip = client->sin_addr;
+    inet_ntop(AF_INET, &client->sin_addr, conn->remote_addr,
               sizeof(conn->remote_addr));
-    conn->requests = 0;
+    conn->request_count = 0;
     conn->group = group;
     buffer_init(&conn->from_client);
     request_init(&conn->request);
@@ -1058,7 +1066,7 @@ void conn_start(Connection *conn, int fd, const struct sockaddr_in *peer,
     conn->upstream_io_at = now;
     conn->lingering_since = now;
     conn->state = CONN_UNUSED;
-    begin_request(conn, now);
+    reset_for_request(conn, now);
 }
 
 typedef struct {
@@ -1078,7 +1086,7 @@ static Interest interest(const Connection *conn) {
         case CONN_READING_BODY:
         case CONN_LINGERING:
         case CONN_DISCARDING_BODY:
-        case CONN_KEEPALIVE:
+        case CONN_IDLE:
             wanted.client_read = 1;
             break;
         case CONN_CONNECTING:
@@ -1097,7 +1105,7 @@ static Interest interest(const Connection *conn) {
             wanted.client_write = buffer_length(&conn->to_client) > 0;
             break;
         case CONN_SENDING_REPLY:
-        case CONN_SENDING_ERROR:
+        case CONN_SENDING_OWN_REPLY:
             wanted.client_write = 1;
             break;
     }
@@ -1141,7 +1149,7 @@ static void on_client_ready(Connection *conn, double now) {
             break;
         case CONN_READING_REPLY:
         case CONN_SENDING_REPLY:
-        case CONN_SENDING_ERROR:
+        case CONN_SENDING_OWN_REPLY:
             send_to_client(conn, now);
             break;
         case CONN_LINGERING:
@@ -1150,8 +1158,8 @@ static void on_client_ready(Connection *conn, double now) {
         case CONN_DISCARDING_BODY:
             discard_body(conn, now);
             break;
-        case CONN_KEEPALIVE:
-            wake(conn, now);
+        case CONN_IDLE:
+            read_idle(conn, now);
             break;
     }
 }
@@ -1174,10 +1182,10 @@ static void on_upstream_ready(Connection *conn, double now) {
         case CONN_READING_HEAD:
         case CONN_READING_BODY:
         case CONN_SENDING_REPLY:
-        case CONN_SENDING_ERROR:
+        case CONN_SENDING_OWN_REPLY:
         case CONN_LINGERING:
         case CONN_DISCARDING_BODY:
-        case CONN_KEEPALIVE:
+        case CONN_IDLE:
             break;
     }
 }
@@ -1233,19 +1241,19 @@ int conn_deadline(const Connection *conn, double *at) {
             *at = conn->upstream_io_at + settings->proxy_read_timeout;
             if (buffer_length(&conn->to_client) > 0) {
                 *at = earlier(*at, conn->client_io_at +
-                                       settings->send_timeout);
+                                       settings->client_send_timeout);
             }
             return 1;
         case CONN_SENDING_REPLY:
-        case CONN_SENDING_ERROR:
-            *at = conn->client_io_at + settings->send_timeout;
+        case CONN_SENDING_OWN_REPLY:
+            *at = conn->client_io_at + settings->client_send_timeout;
             return 1;
         case CONN_LINGERING:
         case CONN_DISCARDING_BODY:
             *at = earlier(conn->lingering_since + LINGERING_TIME,
                           conn->client_io_at + LINGERING_TIMEOUT);
             return 1;
-        case CONN_KEEPALIVE:
+        case CONN_IDLE:
             *at = conn->client_io_at + settings->keepalive_timeout;
             return 1;
     }
@@ -1254,7 +1262,7 @@ int conn_deadline(const Connection *conn, double *at) {
 
 static void upstream_timed_out(Connection *conn, const char *doing,
                                double now) {
-    upstream_failed(conn, 504, ETIMEDOUT, "upstream timed out", doing, now);
+    fail_upstream(conn, 504, ETIMEDOUT, "upstream timed out", doing, now);
 }
 
 void conn_expire(Connection *conn, double now) {
@@ -1268,7 +1276,7 @@ void conn_expire(Connection *conn, double now) {
             break;
         case CONN_READING_HEAD:
         case CONN_READING_BODY:
-            reply_error(conn, 408, now);
+            send_error(conn, 408, now);
             break;
         case CONN_CONNECTING:
             upstream_timed_out(conn, "connecting to upstream", now);
@@ -1288,16 +1296,16 @@ void conn_expire(Connection *conn, double now) {
                                         "reading upstream", ETIMEDOUT,
                          strerror(ETIMEDOUT));
             }
-            finish(conn);
+            log_and_close(conn);
             break;
         case CONN_SENDING_REPLY:
-        case CONN_SENDING_ERROR:
-            finish(conn);
+        case CONN_SENDING_OWN_REPLY:
+            log_and_close(conn);
             break;
         case CONN_LINGERING:
         case CONN_DISCARDING_BODY:
-        case CONN_KEEPALIVE:
-            release(conn);
+        case CONN_IDLE:
+            close_conn(conn);
             break;
     }
 }

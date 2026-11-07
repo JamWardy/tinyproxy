@@ -6,7 +6,7 @@
 typedef enum {
     ROUTE_NONE,      // No location matches: 404.
     ROUTE_LOCATION,
-    ROUTE_REDIRECT,  // To the location's path, which is uri with a '/'.
+    ROUTE_REDIRECT,  // To the location's path, which is path with a '/'.
 } RouteKind;
 
 typedef struct {
@@ -19,8 +19,8 @@ typedef struct {
 // one, then the group's default.
 const Server *find_server(const AddressGroup *group, const char *host);
 
-// Which of server's locations takes uri, nginx's $uri: an exact match, then
+// Which of server's locations takes the normalised path: an exact match, then
 // the redirect for a missing trailing '/', then the longest prefix.
-Route find_route(const Server *server, const char *uri);
+Route find_route(const Server *server, const char *path);
 
 #endif

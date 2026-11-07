@@ -3,10 +3,10 @@
 
 #include "buffer.h"
 
-// nginx's $uri, from a path that may have a query after it: %XX decoded,
-// "//" merged, and "." and ".." resolved. Returns 0, or 400 for a bad escape,
-// a %00 or a climb above "/", or 500 when out of memory.
-int normalise_uri(const char *path, char **uri);
+// The path, from a path that may have a query after it: %XX decoded, "//"
+// merged, and "." and ".." resolved. Returns 0, or 400 for a bad escape, a
+// %00 or a climb above "/", or 500 when out of memory.
+int normalise_path(const char *path_and_query, char **path);
 
 // Appends uri with what can't go in a request line escaped as %XX, as
 // nginx's ngx_escape_uri does. Fails only when out of memory.

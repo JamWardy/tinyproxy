@@ -94,8 +94,8 @@ static int resolve_segments(const char *decoded, char *out) {
     return 0;
 }
 
-int normalise_uri(const char *path, char **uri) {
-    size_t size = strlen(path) + 2;
+int normalise_path(const char *path_and_query, char **path) {
+    size_t size = strlen(path_and_query) + 2;
     char *decoded = malloc(size);
     char *out = malloc(size);
 
@@ -104,7 +104,7 @@ int normalise_uri(const char *path, char **uri) {
         free(out);
         return 500;
     }
-    int status = decode(path, decoded);
+    int status = decode(path_and_query, decoded);
     if (!status) {
         status = resolve_segments(decoded, out);
     }
@@ -113,7 +113,7 @@ int normalise_uri(const char *path, char **uri) {
         free(out);
         return status;
     }
-    *uri = out;
+    *path = out;
     return 0;
 }
 

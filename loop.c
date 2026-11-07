@@ -171,7 +171,7 @@ static Connection *reuse_idle(Connection *connections) {
     for (size_t i = 0; i < MAX_CONNECTIONS; i++) {
         Connection *conn = &connections[i];
 
-        if (conn->state == CONN_KEEPALIVE &&
+        if (conn->state == CONN_IDLE &&
             (!oldest || conn->client_io_at < oldest->client_io_at)) {
             oldest = conn;
         }
@@ -188,9 +188,9 @@ static Connection *reuse_idle(Connection *connections) {
 static void accept_connections(const Listener *listener,
                                Connection *connections, double now) {
     while (1) {
-        struct sockaddr_in peer;
-        socklen_t length = sizeof(peer);
-        int fd = accept(listener->fd, (struct sockaddr *)&peer, &length);
+        struct sockaddr_in client;
+        socklen_t length = sizeof(client);
+        int fd = accept(listener->fd, (struct sockaddr *)&client, &length);
 
         if (fd < 0) {
             return;  // EAGAIN: no more for now; anything else, try later.
@@ -212,7 +212,7 @@ static void accept_connections(const Listener *listener,
         const AddressGroup *group = listener->group
                                         ? listener->group
                                         : arrival_group(listener->port, fd);
-        conn_start(conn, fd, &peer, group, now);
+        conn_start(conn, fd, &client, group, now);
     }
 }
 
@@ -259,7 +259,7 @@ static int catch_stop_signals(sigset_t *while_waiting) {
     sigaddset(&blocked, SIGINT);
     sigaddset(&blocked, SIGTERM);
 
-    // A peer that hangs up mid-send would otherwise kill the proxy.
+    // A client that hangs up mid-send would otherwise kill the proxy.
     signal(SIGPIPE, SIG_IGN);
 
     return sigaction(SIGINT, &action, NULL) == 0 &&

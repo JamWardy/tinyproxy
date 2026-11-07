@@ -24,11 +24,11 @@ unsigned ip_hash_next(unsigned hash, const unsigned char address[4]);
 unsigned key_hash_next(unsigned hash, size_t rehash, const char *key,
                        size_t length);
 
-// hash consistent's ring: points sorted by hash, each naming a server as
-// written in its "server" directive.
+// hash consistent's ring: points sorted by hash, each naming a "host" line
+// as written.
 typedef struct {
     uint32_t hash;
-    const char *server;
+    const char *host;
 } RingPoint;
 
 typedef struct {
@@ -36,7 +36,7 @@ typedef struct {
     size_t count;
 } Ring;
 
-// 160 points per unit of weight for each server, compatible with
+// 160 points per unit of weight for each host, compatible with
 // Cache::Memcached::Fast. Fails only when out of memory.
 int ring_build(Ring *ring, const Upstream *upstream);
 void ring_free(Ring *ring);

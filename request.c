@@ -142,7 +142,7 @@ static int parse_absolute_target(Request *request, const char *authority) {
     if (*end == '?') {
         return 400;
     }
-    request->path = *end == '/' ? end : "/";
+    request->path_and_query = *end == '/' ? end : "/";
     return validate_host(authority, (size_t)(end - authority), &request->host);
 }
 
@@ -177,7 +177,7 @@ static int parse_request_line(Request *request, char *line) {
     request->method = line;
     request->target = target;
     if (target[0] == '/') {
-        request->path = target;
+        request->path_and_query = target;
     } else if (strncasecmp(target, "http://", 7) == 0) {
         status = parse_absolute_target(request, target + 7);
         if (status) {
@@ -187,9 +187,9 @@ static int parse_request_line(Request *request, char *line) {
         return 400;
     }
 
-    const char *query = strchr(request->path, '?');
-    request->args = query ? query + 1 : NULL;
-    return normalise_uri(request->path, &request->uri);
+    const char *query = strchr(request->path_and_query, '?');
+    request->query = query ? query + 1 : NULL;
+    return normalise_path(request->path_and_query, &request->path);
 }
 
 static int parse_content_length(const char *text, size_t *length) {
@@ -322,23 +322,23 @@ void request_init(Request *request) {
     request->head = NULL;
     request->method = NULL;
     request->target = NULL;
+    request->path_and_query = NULL;
     request->path = NULL;
-    request->uri = NULL;
-    request->args = NULL;
+    request->query = NULL;
     request->version = 0;
     request->host = NULL;
     request->headers = NULL;
     request->header_count = 0;
     request->content_length = 0;
     request->expects_continue = 0;
-    request->keepalive = 0;
+    request->wants_keepalive = 0;
 }
 
 void request_free(Request *request) {
     free(request->line);
     free(request->head);
     free(request->host);
-    free(request->uri);
+    free(request->path);
     free(request->headers);
     request_init(request);
 }
@@ -396,13 +396,13 @@ int request_parse(Request *request, const char *head, size_t length) {
     }
     switch (seen.connection) {
         case CONNECTION_UNSAID:
-            request->keepalive = request->version >= HTTP_1_1;
+            request->wants_keepalive = request->version >= HTTP_1_1;
             break;
         case CONNECTION_CLOSE:
-            request->keepalive = 0;
+            request->wants_keepalive = 0;
             break;
         case CONNECTION_KEEP_ALIVE:
-            request->keepalive = 1;
+            request->wants_keepalive = 1;
             break;
     }
     return 0;

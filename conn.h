@@ -25,22 +25,22 @@ typedef enum {
     CONN_READING_REPLY_HEAD,
     CONN_READING_REPLY,      // Passing it on as it comes.
     CONN_SENDING_REPLY,      // The upstream's done; sending what's left.
-    CONN_SENDING_ERROR,      // tinyproxy's own reply.
+    CONN_SENDING_OWN_REPLY,      // tinyproxy's own reply.
     CONN_LINGERING,          // Reading and dropping what the client still
                              // sends, so it gets the reply before the close.
     CONN_DISCARDING_BODY,    // Dropping the body of a request answered
                              // before it came, to keep the connection.
-    CONN_KEEPALIVE,          // Waiting for the next request.
+    CONN_IDLE,          // Waiting for the next request.
 } ConnState;
 
 typedef struct {
     ConnState state;
-    unsigned long long number;  // nginx's *N in the error log.
+    unsigned long long id;  // nginx's *N in the error log.
     int client_fd;
     UpstreamConn upstream;  // From CONN_CONNECTING to CONN_READING_REPLY.
-    struct in_addr remote;  // For ip_hash.
+    struct in_addr remote_ip;  // For ip_hash.
     char remote_addr[INET_ADDRSTRLEN];
-    size_t requests;  // On this connection, the current one included.
+    size_t request_count;  // On this connection, the current one included.
 
     // Borrowed from the config. The server is the group's default until the
     // request's Host picks one. The settings are the server's until the
@@ -48,7 +48,7 @@ typedef struct {
     const AddressGroup *group;
     const Server *server;
     const Location *location;  // NULL until then.
-    const Peer *peer;          // The server it's sent to; NULL until chosen.
+    const Endpoint *endpoint;  // Where it's sent; NULL until chosen.
     const Settings *settings;
 
     // The request's head, then its body, then any requests sent after it.
@@ -58,20 +58,20 @@ typedef struct {
     // The client sent the next request while the upstream had this one.
     // It's kept, and the client isn't read again until this one's done.
     int pipelined;
-    size_t discarding;  // CONN_DISCARDING_BODY's bytes still to come.
+    size_t discard_left;  // CONN_DISCARDING_BODY's bytes still to come.
     Buffer upstream_uri;  // With a NUL after it, once there's a location.
     Buffer to_upstream;
     Buffer from_upstream;  // What's come from the upstream, until it's used.
     Buffer to_client;
     // Once its head is in. Its length counts down as the body comes.
     ReplyHead reply;
-    ReplyBody reply_body;
+    BodyRewrite body_rewrite;
     ChunkDecoder chunks;  // REPLY_CHUNKED's.
-    int keepalive;  // The reply keeps the client's connection.
+    int keep_client;  // The reply keeps the client's connection.
 
     int status;                // What the access log shows.
     size_t reply_head_length;  // So the log can count only the body.
-    size_t sent;               // Bytes sent to the client.
+    size_t sent_to_client;     // In bytes, the head included.
 
     double accepted_at;
     double request_at;  // When the current request's head started.
@@ -84,7 +84,7 @@ typedef struct {
 
 int set_non_blocking(int fd);
 
-void conn_start(Connection *conn, int fd, const struct sockaddr_in *peer,
+void conn_start(Connection *conn, int fd, const struct sockaddr_in *client,
                 const AddressGroup *group, double now);
 
 // Adds the descriptors the connection is waiting on to the sets.

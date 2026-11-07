@@ -19,8 +19,8 @@
 #define DEFAULT_MAX_BODY_SIZE (1024 * 1024)
 #define DEFAULT_KEEPALIVE_TIMEOUT 75.0
 #define DEFAULT_UPSTREAM_KEEPALIVE_TIMEOUT 60.0
-#define DEFAULT_KEEPALIVE_REQUESTS 1000
-#define DEFAULT_KEEPALIVE_TIME 3600.0
+#define DEFAULT_KEEPALIVE_MAX_REQUESTS 1000
+#define DEFAULT_KEEPALIVE_LIFETIME 3600.0
 
 // nginx's own proxy headers, under any proxy_set_header.
 static const Header DEFAULT_PROXY_HEADERS[] = {
@@ -75,22 +75,23 @@ typedef struct {
     int opens_block;
 } Directive;
 
-// What last set nginx's init_upstream for a pool: a method, or keepalive,
-// which wraps the method before it. A method after keepalive replaces it.
+// Which of a balancing method and keepalive_max_idle an upstream block
+// wrote last. As in nginx, a method written after keepalive_max_idle turns
+// it off.
 typedef enum {
-    POOL_INIT_DEFAULT,
-    POOL_INIT_METHOD,
-    POOL_INIT_KEEPALIVE,
-} PoolInit;
+    WROTE_NEITHER,
+    WROTE_METHOD_LAST,
+    WROTE_KEEPALIVE_LAST,
+} UpstreamLast;
 
 // What an upstream block writes, until it's checked and put in its
 // Upstream.
 typedef struct {
-    PoolInit init;
-    OptionalCount keepalive;
+    UpstreamLast last;
+    OptionalCount keepalive_max_idle;
     OptionalSeconds keepalive_timeout;
-    OptionalCount keepalive_requests;
-    OptionalSeconds keepalive_time;
+    OptionalCount keepalive_max_requests;
+    OptionalSeconds keepalive_lifetime;
 } UpstreamSettings;
 
 // The block being read. server, location and upstream are NULL outside
@@ -762,15 +763,15 @@ static Upstream *add_upstream(Config *config, UpstreamKind kind,
     upstream->kind = kind;
     upstream->name = copy;
     upstream->line = line;
-    upstream->number = config->upstream_count;
-    upstream->peers = NULL;
-    upstream->peer_count = 0;
-    upstream->balance.kind = BALANCE_ROUND_ROBIN;
-    upstream->balance.key = NULL;
-    upstream->keepalive.connections = 0;
-    upstream->keepalive.requests = DEFAULT_KEEPALIVE_REQUESTS;
-    upstream->keepalive.time = DEFAULT_KEEPALIVE_TIME;
-    upstream->keepalive.timeout = DEFAULT_UPSTREAM_KEEPALIVE_TIMEOUT;
+    upstream->index = config->upstream_count;
+    upstream->endpoints = NULL;
+    upstream->endpoint_count = 0;
+    upstream->method.kind = BALANCE_ROUND_ROBIN;
+    upstream->method.key = NULL;
+    upstream->keepalive.max_idle = 0;
+    upstream->keepalive.max_requests = DEFAULT_KEEPALIVE_MAX_REQUESTS;
+    upstream->keepalive.lifetime = DEFAULT_KEEPALIVE_LIFETIME;
+    upstream->keepalive.idle_timeout = DEFAULT_UPSTREAM_KEEPALIVE_TIMEOUT;
     config->upstreams[config->upstream_count++] = upstream;
     return upstream;
 }
@@ -812,23 +813,24 @@ static int handle_upstream(Parser *parser, const Scope *scope,
     if (!parse_block(parser, &inner)) {
         return 0;
     }
-    if (upstream->peer_count == 0) {
+    if (upstream->endpoint_count == 0) {
         return parse_error(parser, directive->line,
-                           "no servers are inside upstream");
+                           "no hosts are inside upstream");
     }
 
     UpstreamKeepalive *keepalive = &upstream->keepalive;
-    if (written.keepalive.is_set && written.init == POOL_INIT_KEEPALIVE) {
-        keepalive->connections = written.keepalive.count;
+    if (written.keepalive_max_idle.is_set &&
+        written.last == WROTE_KEEPALIVE_LAST) {
+        keepalive->max_idle = written.keepalive_max_idle.count;
     }
-    if (written.keepalive_requests.is_set) {
-        keepalive->requests = written.keepalive_requests.count;
+    if (written.keepalive_max_requests.is_set) {
+        keepalive->max_requests = written.keepalive_max_requests.count;
     }
-    if (written.keepalive_time.is_set) {
-        keepalive->time = written.keepalive_time.seconds;
+    if (written.keepalive_lifetime.is_set) {
+        keepalive->lifetime = written.keepalive_lifetime.seconds;
     }
     if (written.keepalive_timeout.is_set) {
-        keepalive->timeout = written.keepalive_timeout.seconds;
+        keepalive->idle_timeout = written.keepalive_timeout.seconds;
     }
     return 1;
 }
@@ -856,9 +858,9 @@ static int invalid_parameter(Parser *parser, const Directive *directive,
                        option);
 }
 
-// weight=, max_conns= or down on a server, into options.
-static int take_server_option(Parser *parser, const Directive *directive,
-                              const char *option, Peer *options) {
+// weight=, max_conns= or down on a host, into options.
+static int take_host_option(Parser *parser, const Directive *directive,
+                            const char *option, Endpoint *options) {
     if (strncmp(option, "weight=", 7) == 0) {
         if (!parse_count(option + 7, &options->weight) ||
             options->weight == 0) {
@@ -886,46 +888,46 @@ static int take_server_option(Parser *parser, const Directive *directive,
     return invalid_parameter(parser, directive, option);
 }
 
-// What a server has unless its options say otherwise.
-static Peer default_peer_options(const char *server) {
-    Peer options;
+// What a host's endpoints have unless its options say otherwise.
+static Endpoint default_host_options(const char *host) {
+    Endpoint options;
 
     memset(&options, 0, sizeof(options));
-    options.server = server;
+    options.host = host;
     options.weight = 1;
     return options;
 }
 
-// "server host:port;" in an upstream block.
-static int handle_upstream_server(Parser *parser, const Scope *scope,
-                                  const Directive *directive,
-                                  const DirectiveSpec *spec) {
+// "host name:port;" in an upstream block.
+static int handle_host(Parser *parser, const Scope *scope,
+                       const Directive *directive,
+                       const DirectiveSpec *spec) {
     const char *address = directive->arguments[0];
-    char host[256];
+    char name[256];
     unsigned short port = 80;
 
-    Peer options = default_peer_options(address);
+    Endpoint options = default_host_options(address);
 
     (void)spec;
     for (size_t i = 1; i < directive->argument_count; i++) {
-        if (!take_server_option(parser, directive, directive->arguments[i],
-                                &options)) {
+        if (!take_host_option(parser, directive, directive->arguments[i],
+                              &options)) {
             return 0;
         }
     }
-    if (strlen(address) >= sizeof(host) ||
-        !split_host_port(address, host, &port)) {
+    if (strlen(address) >= sizeof(name) ||
+        !split_host_port(address, name, &port)) {
         return parse_error(parser, directive->line,
                            "invalid port in upstream \"%s\"", address);
     }
-    switch (upstream_add_peers(scope->upstream, host, port, &options)) {
-        case PEERS_ADDED:
+    switch (upstream_add_host(scope->upstream, name, port, &options)) {
+        case HOST_RESOLVED:
             return 1;
-        case PEERS_NOT_FOUND:
+        case HOST_UNKNOWN:
             return parse_error(parser, directive->line,
                                "host not found in upstream \"%s\"",
                                address);
-        case PEERS_OUT_OF_MEMORY:
+        case HOST_OUT_OF_MEMORY:
             return out_of_memory(parser, directive);
     }
     return 0;
@@ -958,16 +960,16 @@ static int link_proxy_pass(Parser *parser, ProxyPass *pass) {
         if (!upstream) {
             return parse_error(parser, pass->line, "out of memory");
         }
-        Peer options = default_peer_options(pass->host);
+        Endpoint options = default_host_options(pass->host);
 
-        switch (upstream_add_peers(upstream, host, port, &options)) {
-            case PEERS_ADDED:
+        switch (upstream_add_host(upstream, host, port, &options)) {
+            case HOST_RESOLVED:
                 break;
-            case PEERS_NOT_FOUND:
+            case HOST_UNKNOWN:
                 return parse_error(parser, pass->line,
                                    "host not found in upstream \"%s\"",
                                    pass->host);
-            case PEERS_OUT_OF_MEMORY:
+            case HOST_OUT_OF_MEMORY:
                 return parse_error(parser, pass->line, "out of memory");
         }
     }
@@ -1114,13 +1116,12 @@ static int handle_size(Parser *parser, const Scope *scope,
     return 1;
 }
 
-// A whole number, as nginx's keepalive_requests. keepalive's N must be at
-// least 1, and it wraps the pool's method so far.
+// A whole number. keepalive_max_idle's must be at least 1.
 static int handle_count(Parser *parser, const Scope *scope,
                         const Directive *directive,
                         const DirectiveSpec *spec) {
     OptionalCount *setting = setting_at(scope, spec);
-    int is_keepalive = strcmp(directive->name, "keepalive") == 0;
+    int is_keepalive = strcmp(directive->name, "keepalive_max_idle") == 0;
     size_t count;
 
     if (setting->is_set) {
@@ -1131,7 +1132,7 @@ static int handle_count(Parser *parser, const Scope *scope,
         return invalid_value(parser, directive);
     }
     if (is_keepalive) {
-        scope->upstream_settings->init = POOL_INIT_KEEPALIVE;
+        scope->upstream_settings->last = WROTE_KEEPALIVE_LAST;
     }
     setting->count = count;
     setting->is_set = 1;
@@ -1163,32 +1164,32 @@ static int handle_keepalive_timeout(Parser *parser, const Scope *scope,
     return 1;
 }
 
-// As nginx: a second method, or one after keepalive, which it replaces,
-// is only a warning.
-static void set_balance(Parser *parser, const Scope *scope,
-                        const Directive *directive, BalanceKind kind,
-                        const char *key) {
+// As nginx: a second method, or one after keepalive_max_idle, which it
+// turns off, is only a warning.
+static void set_method(Parser *parser, const Scope *scope,
+                       const Directive *directive, BalanceKind kind,
+                       const char *key) {
     UpstreamSettings *written = scope->upstream_settings;
 
-    if (written->init != POOL_INIT_DEFAULT) {
+    if (written->last != WROTE_NEITHER) {
         fprintf(stderr, "tinyproxy: [warn] load balancing method redefined "
                         "in %s:%zu\n", parser->path, directive->line);
     }
-    written->init = POOL_INIT_METHOD;
-    scope->upstream->balance.kind = kind;
-    scope->upstream->balance.key = key;
+    written->last = WROTE_METHOD_LAST;
+    scope->upstream->method.kind = kind;
+    scope->upstream->method.key = key;
 }
 
 // least_conn and ip_hash, which take no arguments.
-static int handle_balance(Parser *parser, const Scope *scope,
-                          const Directive *directive,
-                          const DirectiveSpec *spec) {
+static int handle_plain_method(Parser *parser, const Scope *scope,
+                               const Directive *directive,
+                               const DirectiveSpec *spec) {
     (void)spec;
-    set_balance(parser, scope, directive,
-                strcmp(directive->name, "least_conn") == 0
-                    ? BALANCE_LEAST_CONN
-                    : BALANCE_IP_HASH,
-                NULL);
+    set_method(parser, scope, directive,
+               strcmp(directive->name, "least_conn") == 0
+               ? BALANCE_LEAST_CONN
+               : BALANCE_IP_HASH,
+               NULL);
     return 1;
 }
 
@@ -1210,7 +1211,7 @@ static int handle_hash(Parser *parser, const Scope *scope,
     if (!check_variables(parser, directive, key)) {
         return 0;
     }
-    set_balance(parser, scope, directive, kind, key);
+    set_method(parser, scope, directive, kind, key);
     return 1;
 }
 
@@ -1224,8 +1225,7 @@ static const DirectiveSpec DIRECTIVES[] = {
     {"http", CONTEXT_MAIN, 1, 0, 0, handle_http, 0},
     {"server", CONTEXT_HTTP, 1, 0, 0, handle_server, 0},
     {"upstream", CONTEXT_HTTP, 1, 1, 1, handle_upstream, 0},
-    {"server", CONTEXT_UPSTREAM, 0, 1, MAX_ARGUMENTS, handle_upstream_server,
-     0},
+    {"host", CONTEXT_UPSTREAM, 0, 1, MAX_ARGUMENTS, handle_host, 0},
     {"listen", CONTEXT_SERVER, 0, 1, 2, handle_listen, 0},
     {"server_name", CONTEXT_SERVER, 0, 1, MAX_ARGUMENTS, handle_server_name,
      0},
@@ -1242,23 +1242,23 @@ static const DirectiveSpec DIRECTIVES[] = {
     SECONDS(proxy_connect_timeout, ANY_HTTP_BLOCK),
     SECONDS(proxy_send_timeout, ANY_HTTP_BLOCK),
     SECONDS(proxy_read_timeout, ANY_HTTP_BLOCK),
-    SECONDS(send_timeout, ANY_HTTP_BLOCK),
+    SECONDS(client_send_timeout, ANY_HTTP_BLOCK),
     {"keepalive_timeout", ANY_HTTP_BLOCK, 0, 1, 2, handle_keepalive_timeout,
      0},
-    {"keepalive_requests", ANY_HTTP_BLOCK, 0, 1, 1, handle_count,
-     offsetof(BlockSettings, keepalive_requests)},
-    SECONDS(keepalive_time, ANY_HTTP_BLOCK),
-    UPSTREAM(keepalive, handle_count),
-    {"least_conn", CONTEXT_UPSTREAM, 0, 0, 0, handle_balance, 0},
-    {"ip_hash", CONTEXT_UPSTREAM, 0, 0, 0, handle_balance, 0},
+    {"keepalive_max_requests", ANY_HTTP_BLOCK, 0, 1, 1, handle_count,
+     offsetof(BlockSettings, keepalive_max_requests)},
+    SECONDS(keepalive_lifetime, ANY_HTTP_BLOCK),
+    UPSTREAM(keepalive_max_idle, handle_count),
+    {"least_conn", CONTEXT_UPSTREAM, 0, 0, 0, handle_plain_method, 0},
+    {"ip_hash", CONTEXT_UPSTREAM, 0, 0, 0, handle_plain_method, 0},
     {"hash", CONTEXT_UPSTREAM, 0, 1, 2, handle_hash, 0},
     UPSTREAM(keepalive_timeout, handle_seconds),
-    UPSTREAM(keepalive_requests, handle_count),
-    UPSTREAM(keepalive_time, handle_seconds),
+    UPSTREAM(keepalive_max_requests, handle_count),
+    UPSTREAM(keepalive_lifetime, handle_seconds),
 };
 
 // The spec for name in context, or else any for name, for the "not allowed
-// here" error. "server" has one in http and another in upstream.
+// here" error.
 static const DirectiveSpec *find_directive(const char *name,
                                            Context context) {
     const DirectiveSpec *any = NULL;
@@ -1400,8 +1400,8 @@ static Settings inherit(const BlockSettings *own, const Settings *outer) {
         inherit_seconds(&own->proxy_send_timeout, outer->proxy_send_timeout);
     settings.proxy_read_timeout =
         inherit_seconds(&own->proxy_read_timeout, outer->proxy_read_timeout);
-    settings.send_timeout =
-        inherit_seconds(&own->send_timeout, outer->send_timeout);
+    settings.client_send_timeout =
+        inherit_seconds(&own->client_send_timeout, outer->client_send_timeout);
     settings.client_max_body_size = own->client_max_body_size.is_set
                                         ? own->client_max_body_size.bytes
                                         : outer->client_max_body_size;
@@ -1415,11 +1415,11 @@ static Settings inherit(const BlockSettings *own, const Settings *outer) {
         settings.keepalive_timeout = outer->keepalive_timeout;
         settings.keepalive_header_timeout = outer->keepalive_header_timeout;
     }
-    settings.keepalive_requests = own->keepalive_requests.is_set
-                                      ? own->keepalive_requests.count
-                                      : outer->keepalive_requests;
-    settings.keepalive_time =
-        inherit_seconds(&own->keepalive_time, outer->keepalive_time);
+    settings.keepalive_max_requests = own->keepalive_max_requests.is_set
+                                      ? own->keepalive_max_requests.count
+                                      : outer->keepalive_max_requests;
+    settings.keepalive_lifetime =
+        inherit_seconds(&own->keepalive_lifetime, outer->keepalive_lifetime);
     settings.proxy_set_headers = own->proxy_set_headers.count > 0
                                      ? own->proxy_set_headers
                                      : outer->proxy_set_headers;
@@ -1437,14 +1437,14 @@ static Settings default_settings(void) {
     settings.proxy_connect_timeout = DEFAULT_TIMEOUT;
     settings.proxy_send_timeout = DEFAULT_TIMEOUT;
     settings.proxy_read_timeout = DEFAULT_TIMEOUT;
-    settings.send_timeout = DEFAULT_TIMEOUT;
+    settings.client_send_timeout = DEFAULT_TIMEOUT;
     settings.client_max_body_size = DEFAULT_MAX_BODY_SIZE;
     settings.proxy_http_version = HTTP_1_0;
     settings.keepalive_timeout = DEFAULT_KEEPALIVE_TIMEOUT;
     settings.keepalive_header_timeout.is_set = 0;
     settings.keepalive_header_timeout.seconds = 0;
-    settings.keepalive_requests = DEFAULT_KEEPALIVE_REQUESTS;
-    settings.keepalive_time = DEFAULT_KEEPALIVE_TIME;
+    settings.keepalive_max_requests = DEFAULT_KEEPALIVE_MAX_REQUESTS;
+    settings.keepalive_lifetime = DEFAULT_KEEPALIVE_LIFETIME;
     settings.proxy_set_headers.items = NULL;
     settings.proxy_set_headers.count = 0;
     settings.access_log.kind = ACCESS_LOG_OFF;

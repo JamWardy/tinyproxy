@@ -15,8 +15,9 @@
 #define REPLY_HEAD_LIMIT 4096
 
 // The URI sent upstream. With a path in proxy_pass, it's that path in place
-// of the part of $uri the location matched, then the query; without one,
-// it's the URI as the client sent it. Fails only when out of memory.
+// of the part of the normalised path the location matched, then the query;
+// without one, it's the URI as the client sent it. Fails only when out
+// of memory.
 int build_upstream_uri(Buffer *out, const Request *request,
                        const Location *location);
 
@@ -47,7 +48,7 @@ typedef struct {
     size_t length;  // REPLY_LENGTH's.
     // HTTP/1.1 without Connection: close, so the upstream connection may be
     // kept once the reply's in.
-    int upstream_keeps;
+    int upstream_reusable;
 } ReplyHead;
 
 // Reads the upstream's reply head, for a request that was HEAD or not.
@@ -55,17 +56,17 @@ typedef struct {
 int parse_reply_head(const char *head, size_t length, int to_head,
                      ReplyHead *reply);
 
-// How the body goes on to the client.
+// What the body needs on its way to the client.
 typedef enum {
-    REPLY_BODY_AS_IS,
-    REPLY_BODY_DECODED,  // From chunks, for a client that can't read them.
-    REPLY_BODY_ENCODED,  // Into chunks, as it has no length of its own.
-} ReplyBody;
+    REWRITE_NONE,
+    REWRITE_DECHUNK,  // Out of chunks, for a client that can't read them.
+    REWRITE_CHUNK,    // Into chunks, as it has no length of its own.
+} BodyRewrite;
 
 // A head that parse_reply_head took, as the client gets it: with
-// tinyproxy's own Server and Date, the Transfer-Encoding body needs, and
+// tinyproxy's own Server and Date, the Transfer-Encoding rewrite needs, and
 // connection, the Connection header lines. Fails only when out of memory.
 int write_reply_head(Buffer *out, const char *head, size_t length,
-                     ReplyBody body, const char *connection);
+                     BodyRewrite rewrite, const char *connection);
 
 #endif

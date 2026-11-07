@@ -40,8 +40,8 @@ static const ErrorPage *find_error_page(int status) {
     return NULL;
 }
 
-int build_error_reply(Buffer *out, int status, int with_body,
-                      const char *location, const char *connection) {
+int build_own_reply(Buffer *out, int status, int with_body,
+                    const char *location, const char *connection) {
     const ErrorPage *page = find_error_page(status);
     char date[40];
     Buffer html;

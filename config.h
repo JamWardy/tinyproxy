@@ -54,12 +54,12 @@ typedef struct {
     OptionalSeconds proxy_connect_timeout;
     OptionalSeconds proxy_send_timeout;
     OptionalSeconds proxy_read_timeout;
-    OptionalSeconds send_timeout;
+    OptionalSeconds client_send_timeout;
     OptionalSize client_max_body_size;
     OptionalHttpVersion proxy_http_version;
     OptionalKeepaliveTimeout keepalive_timeout;
-    OptionalCount keepalive_requests;
-    OptionalSeconds keepalive_time;
+    OptionalCount keepalive_max_requests;
+    OptionalSeconds keepalive_lifetime;
     // As in nginx, a block that sets any inherits none from around it.
     Headers proxy_set_headers;
     AccessLog access_log;
@@ -73,13 +73,13 @@ typedef struct {
     double proxy_connect_timeout;
     double proxy_send_timeout;
     double proxy_read_timeout;
-    double send_timeout;
+    double client_send_timeout;
     size_t client_max_body_size;  // 0 for no limit.
     int proxy_http_version;
     double keepalive_timeout;  // 0 for no keep-alive.
     OptionalSeconds keepalive_header_timeout;
-    size_t keepalive_requests;
-    double keepalive_time;
+    size_t keepalive_max_requests;
+    double keepalive_lifetime;
     Headers proxy_set_headers;
     AccessLog access_log;  // ACCESS_LOG_OFF or ACCESS_LOG_FILE.
 } Settings;

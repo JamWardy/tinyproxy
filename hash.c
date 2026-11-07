@@ -50,22 +50,22 @@ unsigned key_hash_next(unsigned hash, size_t rehash, const char *key,
     return hash + ((crc >> 16) & 0x7fff);
 }
 
-// The host, a NUL, then the port: the digits after the last ':', or none.
-static uint32_t server_hash(const char *server) {
-    size_t host_length = strlen(server);
+// The name, a NUL, then the port: the digits after the last ':', or none.
+static uint32_t host_hash(const char *host) {
+    size_t name_length = strlen(host);
     const char *port = "";
 
-    for (size_t i = host_length; i-- > 0;) {
-        if (server[i] == ':') {
-            host_length = i;
-            port = server + i + 1;
+    for (size_t i = name_length; i-- > 0;) {
+        if (host[i] == ':') {
+            name_length = i;
+            port = host + i + 1;
             break;
         }
-        if (server[i] < '0' || server[i] > '9') {
+        if (host[i] < '0' || host[i] > '9') {
             break;
         }
     }
-    uint32_t crc = crc32_update(crc32_init(), server, host_length);
+    uint32_t crc = crc32_update(crc32_init(), host, name_length);
 
     crc = crc32_update(crc, "", 1);
     return crc32_update(crc, port, strlen(port));
@@ -81,8 +81,8 @@ static int compare_points(const void *a, const void *b) {
 int ring_build(Ring *ring, const Upstream *upstream) {
     size_t total = 0;
 
-    for (size_t i = 0; i < upstream->peer_count; i++) {
-        total += upstream->peers[i].weight * 160;
+    for (size_t i = 0; i < upstream->endpoint_count; i++) {
+        total += upstream->endpoints[i].weight * 160;
     }
     ring->points = malloc((total ? total : 1) * sizeof(RingPoint));
     ring->count = 0;
@@ -90,12 +90,12 @@ int ring_build(Ring *ring, const Upstream *upstream) {
         return 0;
     }
 
-    for (size_t i = 0; i < upstream->peer_count; i++) {
-        const Peer *peer = &upstream->peers[i];
-        uint32_t base = server_hash(peer->server);
+    for (size_t i = 0; i < upstream->endpoint_count; i++) {
+        const Endpoint *endpoint = &upstream->endpoints[i];
+        uint32_t base = host_hash(endpoint->host);
         uint32_t previous = 0;
 
-        for (size_t j = 0; j < peer->weight * 160; j++) {
+        for (size_t j = 0; j < endpoint->weight * 160; j++) {
             // The last hash, little-endian, whatever the machine's order.
             unsigned char bytes[4] = {
                 (unsigned char)previous, (unsigned char)(previous >> 8),
@@ -104,14 +104,14 @@ int ring_build(Ring *ring, const Upstream *upstream) {
             uint32_t hash = crc32_final(crc32_update(base, bytes, 4));
 
             ring->points[ring->count].hash = hash;
-            ring->points[ring->count].server = peer->server;
+            ring->points[ring->count].host = endpoint->host;
             ring->count++;
             previous = hash;
         }
     }
     qsort(ring->points, ring->count, sizeof(RingPoint), compare_points);
 
-    // Each address of one server gives the same points; one of each stays.
+    // Each endpoint of one host gives the same points; one of each stays.
     size_t kept = 0;
     for (size_t i = 0; i < ring->count; i++) {
         if (kept == 0 || ring->points[kept - 1].hash != ring->points[i].hash) {

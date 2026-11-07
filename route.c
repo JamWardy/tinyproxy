@@ -90,21 +90,21 @@ static Route route(RouteKind kind, const Location *location) {
     return found;
 }
 
-static int is_prefix_of(const Location *location, const char *uri) {
-    return strncmp(uri, location->path, strlen(location->path)) == 0;
+static int is_prefix_of(const Location *location, const char *path) {
+    return strncmp(path, location->path, strlen(location->path)) == 0;
 }
 
 // nginx's auto_redirect: location /api/ with a proxy_pass also answers /api,
 // with a redirect to /api/, which it would otherwise never see.
-static int redirects_from(const Location *location, const char *uri) {
+static int redirects_from(const Location *location, const char *path) {
     size_t length = strlen(location->path);
 
     return location->has_proxy_pass && length > 1 &&
-           location->path[length - 1] == '/' && strlen(uri) == length - 1 &&
-           strncmp(uri, location->path, length - 1) == 0;
+           location->path[length - 1] == '/' && strlen(path) == length - 1 &&
+           strncmp(path, location->path, length - 1) == 0;
 }
 
-Route find_route(const Server *server, const char *uri) {
+Route find_route(const Server *server, const char *path) {
     const Location *longest = NULL;
     const Location *redirect = NULL;
 
@@ -113,15 +113,15 @@ Route find_route(const Server *server, const char *uri) {
 
         switch (location->match) {
             case LOCATION_EXACT:
-                if (strcmp(location->path, uri) == 0) {
+                if (strcmp(location->path, path) == 0) {
                     return route(ROUTE_LOCATION, location);
                 }
                 break;
             case LOCATION_PREFIX:
-                if (redirects_from(location, uri)) {
+                if (redirects_from(location, path)) {
                     redirect = location;
                 }
-                if (is_prefix_of(location, uri) &&
+                if (is_prefix_of(location, path) &&
                     (!longest ||
                      strlen(location->path) > strlen(longest->path))) {
                     longest = location;

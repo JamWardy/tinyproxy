@@ -7,7 +7,7 @@
 #include <unistd.h>
 
 typedef struct {
-    const Peer *peer;
+    const Endpoint *endpoint;
     UpstreamConn conn;
     double idle_since;
 } IdleConn;
@@ -31,7 +31,7 @@ int keepalive_init(const Config *config) {
     pool_count = config->upstream_count;
     for (size_t i = 0; i < pool_count; i++) {
         const Upstream *upstream = config->upstreams[i];
-        size_t size = upstream->keepalive.connections;
+        size_t size = upstream->keepalive.max_idle;
 
         pools[i].upstream = upstream;
         if (size > 0) {
@@ -68,12 +68,12 @@ static void close_idle(Pool *pool, size_t index) {
     remove_idle(pool, index);
 }
 
-int keepalive_take(const Upstream *upstream, const Peer *peer,
+int keepalive_take(const Upstream *upstream, const Endpoint *endpoint,
                    UpstreamConn *conn) {
-    Pool *pool = &pools[upstream->number];
+    Pool *pool = &pools[upstream->index];
 
     for (size_t i = pool->count; i-- > 0;) {
-        if (pool->idle[i].peer == peer) {
+        if (pool->idle[i].endpoint == endpoint) {
             *conn = pool->idle[i].conn;
             remove_idle(pool, i);
             return 1;
@@ -82,21 +82,21 @@ int keepalive_take(const Upstream *upstream, const Peer *peer,
     return 0;
 }
 
-void keepalive_keep(const Upstream *upstream, const Peer *peer,
+void keepalive_keep(const Upstream *upstream, const Endpoint *endpoint,
                     const UpstreamConn *conn, double now) {
-    Pool *pool = &pools[upstream->number];
+    Pool *pool = &pools[upstream->index];
     const UpstreamKeepalive *limits = &upstream->keepalive;
 
-    if (limits->connections == 0 || conn->requests >= limits->requests ||
-        now - conn->opened_at > limits->time) {
+    if (limits->max_idle == 0 || conn->requests >= limits->max_requests ||
+        now - conn->opened_at > limits->lifetime) {
         close(conn->fd);
         return;
     }
-    if (pool->count == limits->connections) {
+    if (pool->count == limits->max_idle) {
         close_idle(pool, 0);
     }
     IdleConn *idle = &pool->idle[pool->count++];
-    idle->peer = peer;
+    idle->endpoint = endpoint;
     idle->conn = *conn;
     idle->idle_since = now;
 }
@@ -141,7 +141,7 @@ int keepalive_deadline(double *at) {
     int found = 0;
 
     for (size_t i = 0; i < pool_count; i++) {
-        double timeout = pools[i].upstream->keepalive.timeout;
+        double timeout = pools[i].upstream->keepalive.idle_timeout;
 
         for (size_t j = 0; j < pools[i].count; j++) {
             double due = pools[i].idle[j].idle_since + timeout;
@@ -158,7 +158,7 @@ int keepalive_deadline(double *at) {
 void keepalive_expire(double now) {
     for (size_t i = 0; i < pool_count; i++) {
         Pool *pool = &pools[i];
-        double timeout = pool->upstream->keepalive.timeout;
+        double timeout = pool->upstream->keepalive.idle_timeout;
 
         for (size_t j = pool->count; j-- > 0;) {
             if (now >= pool->idle[j].idle_since + timeout) {

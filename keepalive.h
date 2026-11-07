@@ -1,15 +1,15 @@
 #ifndef TINYPROXY_KEEPALIVE_H
 #define TINYPROXY_KEEPALIVE_H
 
-// nginx's upstream keepalive: each pool's idle connections to its servers,
-// kept for the next request.
+// Each pool's idle connections to its endpoints, kept for the next request
+// (nginx's upstream keepalive).
 
 #include <stddef.h>
 #include <sys/select.h>
 
 #include "config.h"
 
-// A connection to an upstream server.
+// A connection to an endpoint.
 typedef struct {
     int fd;           // -1 for none.
     size_t requests;  // Sent on it, the current one included.
@@ -22,20 +22,20 @@ int keepalive_init(const Config *config);
 // Closes every idle connection.
 void keepalive_free(void);
 
-// Takes the most recently kept idle connection to peer in upstream's pool.
+// Takes the most recently kept idle connection to endpoint in upstream.
 // Fails if there's none.
-int keepalive_take(const Upstream *upstream, const Peer *peer,
+int keepalive_take(const Upstream *upstream, const Endpoint *endpoint,
                    UpstreamConn *conn);
 
-// Keeps conn idle for the next request to peer, closing the pool's least
+// Keeps conn idle for the next request to endpoint, closing the pool's least
 // recently used one if it's full. Closes conn instead if the pool keeps
-// none, or conn has reached keepalive_requests or keepalive_time.
-void keepalive_keep(const Upstream *upstream, const Peer *peer,
+// none, or conn has reached keepalive_max_requests or keepalive_lifetime.
+void keepalive_keep(const Upstream *upstream, const Endpoint *endpoint,
                     const UpstreamConn *conn, double now);
 
 void keepalive_watch(fd_set *reads, int *highest);
 
-// Closes those that turned readable: the server closed them, or sent what
+// Closes those that turned readable: the endpoint closed them, or sent what
 // no request asked for.
 void keepalive_handle_ready(const fd_set *reads);
 

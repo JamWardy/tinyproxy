@@ -31,9 +31,9 @@ typedef struct {
     char *head;  // A copy of the head, cut up into the strings below.
     const char *method;
     const char *target;
-    const char *path;  // The target without any "http://host" before it.
-    char *uri;         // nginx's $uri: the path normalised, without a query.
-    const char *args;  // nginx's $args: the query after '?', or NULL.
+    const char *path_and_query;  // The target without any "http://host".
+    char *path;          // Normalised, without the query (nginx's $uri).
+    const char *query;   // After the '?', or NULL (nginx's $args).
     int version;
     char *host;  // $host: lowercased, without the port; "" if none.
     Header *headers;  // Only those with names nginx passes on.
@@ -42,7 +42,7 @@ typedef struct {
     int expects_continue;
     // The client asked to keep the connection, by its version and
     // Connection.
-    int keepalive;
+    int wants_keepalive;
 } Request;
 
 void request_init(Request *request);

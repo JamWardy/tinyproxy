@@ -45,16 +45,16 @@ int build_upstream_uri(Buffer *out, const Request *request,
     const char *replacement = location->proxy_pass.uri;
 
     if (!replacement) {
-        return buffer_append_text(out, request->path);
+        return buffer_append_text(out, request->path_and_query);
     }
     size_t matched = location->match == LOCATION_EXACT
-                         ? strlen(request->uri)
+                         ? strlen(request->path)
                          : strlen(location->path);
     int ok = buffer_append_text(out, replacement) &&
-             append_escaped_uri(out, request->uri + matched);
-    if (ok && request->args && *request->args) {
+             append_escaped_uri(out, request->path + matched);
+    if (ok && request->query && *request->query) {
         ok = buffer_append(out, "?", 1) &&
-             buffer_append_text(out, request->args);
+             buffer_append_text(out, request->query);
     }
     return ok;
 }
@@ -209,7 +209,7 @@ static int read_reply_headers(char *cursor, ReplyHead *reply) {
             has_length = 1;
         } else if (strcasecmp(name, "Connection") == 0 &&
                    contains_ignoring_case(value, "close")) {
-            reply->upstream_keeps = 0;
+            reply->upstream_reusable = 0;
         }
     }
     if (found < 0) {
@@ -240,7 +240,7 @@ int parse_reply_head(const char *head, size_t length, int to_head,
     if (result == 0) {
         reply->status = code;
         reply->length = 0;
-        reply->upstream_keeps = version >= HTTP_1_1;
+        reply->upstream_reusable = version >= HTTP_1_1;
         reply->framing = to_head || code < 200 || code == 204 || code == 304
                              ? REPLY_NO_BODY
                              : REPLY_UNTIL_CLOSE;
@@ -251,7 +251,7 @@ int parse_reply_head(const char *head, size_t length, int to_head,
 }
 
 static int copy_reply_headers(Buffer *out, char *cursor,
-                              const char *status_text, ReplyBody body,
+                              const char *status_text, BodyRewrite rewrite,
                               const char *connection) {
     char date[40];
     char *name;
@@ -265,21 +265,21 @@ static int copy_reply_headers(Buffer *out, char *cursor,
     // parse_reply_head checked every line.
     while (next_header(&cursor, &name, &value) == 1) {
         int dropped = is_hidden(name) ||
-                      (body == REPLY_BODY_DECODED &&
+                      (rewrite == REWRITE_DECHUNK &&
                        strcasecmp(name, "Transfer-Encoding") == 0);
 
         if (!dropped && !append_header(out, name, value, strlen(value))) {
             return 0;
         }
     }
-    return (body != REPLY_BODY_ENCODED ||
+    return (rewrite != REWRITE_CHUNK ||
             buffer_append_text(out, "Transfer-Encoding: chunked\r\n")) &&
            buffer_append_text(out, connection) &&
            buffer_append(out, "\r\n", 2);
 }
 
 int write_reply_head(Buffer *out, const char *head, size_t length,
-                     ReplyBody body, const char *connection) {
+                     BodyRewrite rewrite, const char *connection) {
     char *copy;
     char *cursor;
     int version;
@@ -287,7 +287,7 @@ int write_reply_head(Buffer *out, const char *head, size_t length,
     const char *status_text;
     int ok = open_head(head, length, &copy, &cursor, &version, &code,
                        &status_text) == 0 &&
-             copy_reply_headers(out, cursor, status_text, body, connection);
+             copy_reply_headers(out, cursor, status_text, rewrite, connection);
 
     free(copy);
     return ok;
