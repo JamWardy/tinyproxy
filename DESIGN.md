@@ -93,8 +93,10 @@ A request that matches no `location` gets `404`.
 - With nginx's default headers, `Host: $proxy_host` (the host and port
   in `proxy_pass`) and `Connection: close`, and the client's others as
   they are. `proxy_set_header` adds or replaces one, and an empty value
-  removes it. Its values can use `$host`, `$remote_addr`, `$proxy_host`
-  and `$proxy_add_x_forwarded_for`. The shop's config sets `Host $host`
+  removes it. Its values can use `$host`, `$remote_addr`, `$proxy_host`,
+  `$proxy_add_x_forwarded_for`, and from stage 6, `$request_uri` (the
+  path and query as the client sent them), `$uri` (stage 2's normalised path) and
+  `$args` (the query). The shop's config sets `Host $host`
   and `X-Forwarded-For $proxy_add_x_forwarded_for`.
 - A refused connection gets `502`. `proxy_connect_timeout` (60 s) to
   connect, or `504`, and `proxy_send_timeout` (60 s) between two
@@ -288,13 +290,53 @@ Each stage adds nginx's directives for it.
    - It needs tinyhttp's keep-alive, in `../tinyhttp/DESIGN.md`, whose
      idle time in the shop is longer, so tinyproxy always closes an
      idle connection first.
-6. **Load balancing:** round robin by default, with `weight=` on a
-   `server`; `least_conn;` picks the one with the fewest open
-   connections.
+6. **Load balancing:** as nginx's, a server is chosen for each request,
+   not each connection; then stage 5's `keepalive` looks for an idle
+   connection to it.
+   - **Round robin**, the default, is nginx's smooth weighted round
+     robin. `weight=N` on a `server` (1 by default) is given to each of
+     its addresses. For each request every server's score goes up by
+     its weight, the highest is chosen (the first in the block on a
+     tie), and its score goes down by the total of the weights, so
+     weights 5, 1 and 1 give `a a b a c a a`. A `proxy_pass` to a host
+     with several addresses is balanced the same way.
+   - **`least_conn;`** chooses the server with the fewest active
+     connections for its weight, comparing `conns_a × weight_b` with
+     `conns_b × weight_a`, and round robin among those that tie. A
+     connection is active from when its server is chosen until its
+     reply is all in or it fails; idle kept ones don't count.
+   - **`ip_hash;`** keeps a client on one server: the first three parts
+     of its IPv4 address are hashed as nginx does, and the hash, modulo
+     the total weight, picks a server by weight.
+   - **`hash key;`** does the same with `key`, which can use the
+     variables `proxy_set_header` can, such as `$request_uri`, hashed with CRC32 as nginx's
+     (compatible with Cache::Memcached). **`hash key consistent;`** is
+     ketama consistent hashing, as nginx's (compatible with
+     Cache::Memcached::Fast): each server has 160 points per unit of
+     weight on a ring, and the key goes to the first point at or after
+     its hash, so adding or removing a server moves only its share of
+     keys.
+   - `down` on a `server` skips it for good, and `max_conns=N` skips it
+     while it has N active connections; idle kept ones don't count, so
+     with `keepalive` the total open can be more. A hash that lands on
+     one it can't use hashes again, and after 20 tries falls back to
+     round robin. With none left, the client gets `502`, and the error
+     log nginx's `no live upstreams while connecting to upstream`.
+   - These stop it starting: `weight=` that isn't a whole number from 1
+     (`invalid parameter "weight=0"`), `max_conns=` that isn't a whole
+     number, `hash` without a key or with anything but `consistent`
+     after it, and `least_conn` or `ip_hash` with arguments.
+   - As in nginx, a pool has one method, and a second gets `[warn] load
+     balancing method redefined`, the last one winning. A method after
+     `keepalive` in the block also turns `keepalive` off for the pool,
+     with the same warning, as nginx's docs say to write the method
+     first.
 7. **Passive health checks:** `max_fails` (1) and `fail_timeout`
    (10 s) on a `server`: after `max_fails` failures within
    `fail_timeout`, it's skipped for `fail_timeout`. With none left, the
-   client gets `502`. Active checks are the gateway's.
+   client gets `502`. `backup` on a `server` keeps it for when every
+   other one is skipped or `down`, and stops it starting with `hash` or
+   `ip_hash`, as in nginx. Active checks are the gateway's.
 8. **Phases:** hooks at nginx's phases, which the gateway's Python
    runs in, as OpenResty's `*_by_lua` directives do: access (allow it,
    or answer here), balancer (pick the server), header filter, body
@@ -321,6 +363,10 @@ Stages 9 and 10 are the gateway's.
 - No `location` inside another; nginx allows them. One stops it
   starting.
 - One `access_log` per block; nginx can write to several.
+- No `random` balancing method, nginx's `random` and `random two`.
+- No `$cookie_<name>` or `$http_<name>` variables, so `hash` can't keep a
+  session on one server. The shop has no sessions: its JWT is sent with
+  every request, and any service can answer any request.
 - No `keepalive_disable`, which turns keep-alive off for old browsers,
   or `chunked_transfer_encoding off`.
 - `select()` can't wait on a file descriptor over 1023, so about a

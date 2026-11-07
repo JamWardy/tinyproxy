@@ -17,6 +17,7 @@ tinyproxy/
   route.c/.h      choosing the server and the location
   upstream.c/.h   upstream pools and choosing a server from one
   keepalive.c/.h  idle upstream connections, kept for the next request
+  hash.c/.h       ip_hash, hash and hash consistent, with CRC32
   variables.c/.h  $host and the others, for proxy_set_header
   error_page.c/.h tinyproxy's own replies and nginx's pages
   http.c/.h       what those share: header types, versions, line helpers
@@ -99,8 +100,31 @@ tinyproxy/
         connection reused across clients, a service restarted under
         tinyproxy (a `GET` sent again, a `POST` getting `502`), and
         idle connections timing out on both sides
-- [ ] 6: round robin with `weight=`, and `least_conn`
-- [ ] 7: `max_fails` and `fail_timeout`
+- [ ] 6: load balancing, as in `DESIGN.md`:
+  - [x] `weight=`, `down` and `max_conns=` on a `server`, and
+        `least_conn`, `ip_hash` and `hash`, with their errors and the
+        `load balancing method redefined` warning
+  - [x] Each pool's runtime state, as `keepalive.c` keeps it, since the
+        config is `const` by then: each server's score and active
+        connections, in `upstream.c`, set up and freed by the loop
+  - [x] Smooth weighted round robin and `least_conn`, in `upstream.c`;
+        `choose_peer` counts the connection, and a new `release_peer`
+        uncounts it, called by `enter` where it closes the upstream
+        socket and by `upstream_error` before it chooses again
+  - [x] `$request_uri`, `$uri` and `$args`, in `variables.c`
+  - [x] `ip_hash`, `hash` and `hash consistent`, with CRC32 and the
+        ketama ring, in `hash.c`; the key is expanded per request in
+        `conn.c`
+  - [x] `down`, `max_conns=`, the 20 tries and the `502`
+  - [ ] Try it by hand: two tinyhttp echoes with `weight=3` and
+        `weight=1`, the order in their logs; `least_conn` with a slow
+        request holding one; `ip_hash` from two client addresses
+        (`127.0.0.1` and `127.0.0.2`); `hash $remote_addr` and
+        `consistent` keeping a client as a third server is added;
+        `down`, `max_conns=1` with two requests at once, all down
+        (`502`); `keepalive` reusing each server's connections; a host
+        with two addresses; each config error and the warning
+- [ ] 7: `max_fails`, `fail_timeout` and `backup`
 
 ## Stage 8: phases
 

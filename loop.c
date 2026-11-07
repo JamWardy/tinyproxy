@@ -323,7 +323,8 @@ int loop_run(const Config *config) {
     if (!open_listeners(config, &listeners)) {
         return 1;
     }
-    if (!keepalive_init(config)) {
+    if (!keepalive_init(config) ||
+        !balancers_init(config->upstreams, config->upstream_count)) {
         error_log("emerg", "out of memory");
         keepalive_free();
         close_listeners(&listeners);
@@ -355,6 +356,7 @@ int loop_run(const Config *config) {
         }
     }
     keepalive_free();
+    balancers_free();
     close_listeners(&listeners);
     return 0;
 }

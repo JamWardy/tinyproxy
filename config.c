@@ -75,9 +75,18 @@ typedef struct {
     int opens_block;
 } Directive;
 
+// What last set nginx's init_upstream for a pool: a method, or keepalive,
+// which wraps the method before it. A method after keepalive replaces it.
+typedef enum {
+    POOL_INIT_DEFAULT,
+    POOL_INIT_METHOD,
+    POOL_INIT_KEEPALIVE,
+} PoolInit;
+
 // What an upstream block writes, until it's checked and put in its
 // Upstream.
 typedef struct {
+    PoolInit init;
     OptionalCount keepalive;
     OptionalSeconds keepalive_timeout;
     OptionalCount keepalive_requests;
@@ -365,7 +374,7 @@ static int split_host_port(const char *text, char *host,
 // Checks every $variable in a proxy_set_header value is one there is.
 static int check_variables(Parser *parser, const Directive *directive,
                            const char *value) {
-    static const Variables NO_VALUES = {"", "", "", ""};
+    static const Variables NO_VALUES = {"", "", "", "", "", "", ""};
 
     for (const char *at = strchr(value, '$'); at; at = strchr(at, '$')) {
         const char *name;
@@ -756,6 +765,8 @@ static Upstream *add_upstream(Config *config, UpstreamKind kind,
     upstream->number = config->upstream_count;
     upstream->peers = NULL;
     upstream->peer_count = 0;
+    upstream->balance.kind = BALANCE_ROUND_ROBIN;
+    upstream->balance.key = NULL;
     upstream->keepalive.connections = 0;
     upstream->keepalive.requests = DEFAULT_KEEPALIVE_REQUESTS;
     upstream->keepalive.time = DEFAULT_KEEPALIVE_TIME;
@@ -807,7 +818,7 @@ static int handle_upstream(Parser *parser, const Scope *scope,
     }
 
     UpstreamKeepalive *keepalive = &upstream->keepalive;
-    if (written.keepalive.is_set) {
+    if (written.keepalive.is_set && written.init == POOL_INIT_KEEPALIVE) {
         keepalive->connections = written.keepalive.count;
     }
     if (written.keepalive_requests.is_set) {
@@ -839,21 +850,50 @@ static int parse_count(const char *text, size_t *count) {
     return 1;
 }
 
-// A server option, none of which this stage has.
-static int check_server_option(Parser *parser, const Directive *directive,
-                               const char *option) {
+static int invalid_parameter(Parser *parser, const Directive *directive,
+                             const char *option) {
+    return parse_error(parser, directive->line, "invalid parameter \"%s\"",
+                       option);
+}
+
+// weight=, max_conns= or down on a server, into options.
+static int take_server_option(Parser *parser, const Directive *directive,
+                              const char *option, Peer *options) {
     if (strncmp(option, "weight=", 7) == 0) {
-        return parse_error(parser, directive->line,
-                           "\"weight\" is not supported until stage 6");
+        if (!parse_count(option + 7, &options->weight) ||
+            options->weight == 0) {
+            return invalid_parameter(parser, directive, option);
+        }
+        return 1;
+    }
+    if (strncmp(option, "max_conns=", 10) == 0) {
+        if (!parse_count(option + 10, &options->max_conns)) {
+            return invalid_parameter(parser, directive, option);
+        }
+        return 1;
+    }
+    if (strcmp(option, "down") == 0) {
+        options->down = 1;
+        return 1;
     }
     if (strncmp(option, "max_fails=", 10) == 0 ||
-        strncmp(option, "fail_timeout=", 13) == 0) {
+        strncmp(option, "fail_timeout=", 13) == 0 ||
+        strcmp(option, "backup") == 0) {
         return parse_error(parser, directive->line,
                            "\"%.*s\" is not supported until stage 7",
                            (int)strcspn(option, "="), option);
     }
-    return parse_error(parser, directive->line, "invalid parameter \"%s\"",
-                       option);
+    return invalid_parameter(parser, directive, option);
+}
+
+// What a server has unless its options say otherwise.
+static Peer default_peer_options(const char *server) {
+    Peer options;
+
+    memset(&options, 0, sizeof(options));
+    options.server = server;
+    options.weight = 1;
+    return options;
 }
 
 // "server host:port;" in an upstream block.
@@ -864,10 +904,12 @@ static int handle_upstream_server(Parser *parser, const Scope *scope,
     char host[256];
     unsigned short port = 80;
 
+    Peer options = default_peer_options(address);
+
     (void)spec;
     for (size_t i = 1; i < directive->argument_count; i++) {
-        if (!check_server_option(parser, directive,
-                                 directive->arguments[i])) {
+        if (!take_server_option(parser, directive, directive->arguments[i],
+                                &options)) {
             return 0;
         }
     }
@@ -876,7 +918,7 @@ static int handle_upstream_server(Parser *parser, const Scope *scope,
         return parse_error(parser, directive->line,
                            "invalid port in upstream \"%s\"", address);
     }
-    switch (upstream_add_peers(scope->upstream, host, port)) {
+    switch (upstream_add_peers(scope->upstream, host, port, &options)) {
         case PEERS_ADDED:
             return 1;
         case PEERS_NOT_FOUND:
@@ -916,7 +958,9 @@ static int link_proxy_pass(Parser *parser, ProxyPass *pass) {
         if (!upstream) {
             return parse_error(parser, pass->line, "out of memory");
         }
-        switch (upstream_add_peers(upstream, host, port)) {
+        Peer options = default_peer_options(pass->host);
+
+        switch (upstream_add_peers(upstream, host, port, &options)) {
             case PEERS_ADDED:
                 break;
             case PEERS_NOT_FOUND:
@@ -1071,7 +1115,7 @@ static int handle_size(Parser *parser, const Scope *scope,
 }
 
 // A whole number, as nginx's keepalive_requests. keepalive's N must be at
-// least 1.
+// least 1, and it wraps the pool's method so far.
 static int handle_count(Parser *parser, const Scope *scope,
                         const Directive *directive,
                         const DirectiveSpec *spec) {
@@ -1085,6 +1129,9 @@ static int handle_count(Parser *parser, const Scope *scope,
     if (!parse_count(directive->arguments[0], &count) ||
         (is_keepalive && count == 0)) {
         return invalid_value(parser, directive);
+    }
+    if (is_keepalive) {
+        scope->upstream_settings->init = POOL_INIT_KEEPALIVE;
     }
     setting->count = count;
     setting->is_set = 1;
@@ -1113,6 +1160,57 @@ static int handle_keepalive_timeout(Parser *parser, const Scope *scope,
         setting->header.is_set = 1;
     }
     setting->is_set = 1;
+    return 1;
+}
+
+// As nginx: a second method, or one after keepalive, which it replaces,
+// is only a warning.
+static void set_balance(Parser *parser, const Scope *scope,
+                        const Directive *directive, BalanceKind kind,
+                        const char *key) {
+    UpstreamSettings *written = scope->upstream_settings;
+
+    if (written->init != POOL_INIT_DEFAULT) {
+        fprintf(stderr, "tinyproxy: [warn] load balancing method redefined "
+                        "in %s:%zu\n", parser->path, directive->line);
+    }
+    written->init = POOL_INIT_METHOD;
+    scope->upstream->balance.kind = kind;
+    scope->upstream->balance.key = key;
+}
+
+// least_conn and ip_hash, which take no arguments.
+static int handle_balance(Parser *parser, const Scope *scope,
+                          const Directive *directive,
+                          const DirectiveSpec *spec) {
+    (void)spec;
+    set_balance(parser, scope, directive,
+                strcmp(directive->name, "least_conn") == 0
+                    ? BALANCE_LEAST_CONN
+                    : BALANCE_IP_HASH,
+                NULL);
+    return 1;
+}
+
+// "hash key;" or "hash key consistent;".
+static int handle_hash(Parser *parser, const Scope *scope,
+                       const Directive *directive,
+                       const DirectiveSpec *spec) {
+    const char *key = directive->arguments[0];
+    BalanceKind kind = BALANCE_HASH;
+
+    (void)spec;
+    if (directive->argument_count > 1) {
+        if (strcmp(directive->arguments[1], "consistent") != 0) {
+            return invalid_parameter(parser, directive,
+                                     directive->arguments[1]);
+        }
+        kind = BALANCE_HASH_CONSISTENT;
+    }
+    if (!check_variables(parser, directive, key)) {
+        return 0;
+    }
+    set_balance(parser, scope, directive, kind, key);
     return 1;
 }
 
@@ -1151,6 +1249,9 @@ static const DirectiveSpec DIRECTIVES[] = {
      offsetof(BlockSettings, keepalive_requests)},
     SECONDS(keepalive_time, ANY_HTTP_BLOCK),
     UPSTREAM(keepalive, handle_count),
+    {"least_conn", CONTEXT_UPSTREAM, 0, 0, 0, handle_balance, 0},
+    {"ip_hash", CONTEXT_UPSTREAM, 0, 0, 0, handle_balance, 0},
+    {"hash", CONTEXT_UPSTREAM, 0, 1, 2, handle_hash, 0},
     UPSTREAM(keepalive_timeout, handle_seconds),
     UPSTREAM(keepalive_requests, handle_count),
     UPSTREAM(keepalive_time, handle_seconds),

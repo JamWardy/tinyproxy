@@ -4,10 +4,14 @@
 #include <netinet/in.h>
 #include <stddef.h>
 
-// One server in a pool, nginx's peer.
+// One server in a pool, nginx's peer: one address of a "server".
 typedef struct {
     struct sockaddr_in address;
-    char text[32];  // "127.0.0.1:8003", for the error log.
+    char text[32];       // "127.0.0.1:8003", for the error log.
+    const char *server;  // As written in its "server", for hash consistent.
+    size_t weight;
+    size_t max_conns;  // 0 for no limit.
+    int down;
 } Peer;
 
 typedef enum {
@@ -23,6 +27,19 @@ typedef struct {
     double timeout;      // keepalive_timeout.
 } UpstreamKeepalive;
 
+typedef enum {
+    BALANCE_ROUND_ROBIN,
+    BALANCE_LEAST_CONN,
+    BALANCE_IP_HASH,
+    BALANCE_HASH,
+    BALANCE_HASH_CONSISTENT,
+} BalanceKind;
+
+typedef struct {
+    BalanceKind kind;
+    const char *key;  // The hashes': the key, with its variables unfilled.
+} Balance;
+
 // A pool of servers, nginx's upstream.
 typedef struct {
     UpstreamKind kind;
@@ -31,6 +48,7 @@ typedef struct {
     size_t number;  // Its place in Config.upstreams.
     Peer *peers;
     size_t peer_count;
+    Balance balance;
     UpstreamKeepalive keepalive;
 } Upstream;
 
@@ -40,13 +58,26 @@ typedef enum {
     PEERS_OUT_OF_MEMORY,
 } AddPeers;
 
-// Adds a server for each IPv4 address host resolves to, once, at startup.
+// Adds a server for each IPv4 address host resolves to, once, at startup,
+// with server as written and the server's options.
 AddPeers upstream_add_peers(Upstream *upstream, const char *host,
-                            unsigned short port);
+                            unsigned short port, const Peer *options);
 
 void upstream_free(Upstream *upstream);
 
-// Which server the next request goes to. Always the first until stage 6.
-const Peer *choose_peer(const Upstream *upstream);
+// ---- Choosing ----
+
+// Each pool's counts and scores, which change as requests come. Fails only
+// when out of memory.
+int balancers_init(Upstream *const *upstreams, size_t count);
+void balancers_free(void);
+
+// The server for the next request, by the pool's method, counted as active
+// until release_peer. client is the client's address, for ip_hash, and key
+// the hash's key with its variables filled. NULL if none can be used.
+const Peer *choose_peer(const Upstream *upstream, struct in_addr client,
+                        const char *key, size_t key_length);
+
+void release_peer(const Upstream *upstream, const Peer *peer);
 
 #endif

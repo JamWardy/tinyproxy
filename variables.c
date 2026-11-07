@@ -44,6 +44,15 @@ const char *variable_value(const Variables *variables, const char *name,
     if (name_is(name, length, "proxy_add_x_forwarded_for")) {
         return variables->proxy_add_x_forwarded_for;
     }
+    if (name_is(name, length, "request_uri")) {
+        return variables->request_uri;
+    }
+    if (name_is(name, length, "uri")) {
+        return variables->uri;
+    }
+    if (name_is(name, length, "args")) {
+        return variables->args;
+    }
     return NULL;
 }
 

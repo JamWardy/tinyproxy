@@ -59,9 +59,12 @@ static void close_upstream(Connection *conn) {
     }
 }
 
-// Moves to state. Leaving the upstream's states closes the upstream
-// connection if it wasn't kept.
+// Moves to state. Leaving the upstream's states ends the server's active
+// connection, and closes it if it wasn't kept.
 static void enter(Connection *conn, ConnState state) {
+    if (has_upstream(conn->state) && !has_upstream(state) && conn->peer) {
+        release_peer(conn->location->proxy_pass.upstream, conn->peer);
+    }
     if (!has_upstream(state)) {
         close_upstream(conn);
     }
@@ -439,27 +442,46 @@ static int build_forwarded_for(const Connection *conn, Buffer *out) {
     return buffer_append_text(out, conn->remote_addr);
 }
 
-static int build_request(Connection *conn) {
+// The variables' values for this request. forwarded is given
+// $proxy_add_x_forwarded_for's. Fails only when out of memory.
+static int fill_variables(const Connection *conn, Buffer *forwarded,
+                          Variables *variables) {
+    const Request *request = &conn->request;
+
+    // The trailing NUL makes forwarded's bytes a string.
+    if (!build_forwarded_for(conn, forwarded) ||
+        !buffer_append(forwarded, "", 1)) {
+        return 0;
+    }
+    variables->host = host_variable(conn);
+    variables->remote_addr = conn->remote_addr;
+    variables->proxy_host = conn->location->proxy_pass.host;
+    variables->proxy_add_x_forwarded_for = buffer_bytes(forwarded);
+    variables->request_uri = request->path;
+    variables->uri = request->uri;
+    variables->args = request->args ? request->args : "";
+    return 1;
+}
+
+// The request as it goes upstream, and the hash's key if the pool has one.
+// Fails only when out of memory.
+static int build_request(Connection *conn, Buffer *key) {
     const Location *location = conn->location;
+    const char *key_template = location->proxy_pass.upstream->balance.key;
     Buffer forwarded;
+    Variables variables;
 
     buffer_init(&forwarded);
     buffer_clear(&conn->to_upstream);
-    // The trailing NUL makes forwarded's bytes a string.
-    int ok = build_forwarded_for(conn, &forwarded) &&
-             buffer_append(&forwarded, "", 1);
-    if (ok) {
-        Variables variables;
-        variables.host = host_variable(conn);
-        variables.remote_addr = conn->remote_addr;
-        variables.proxy_host = location->proxy_pass.host;
-        variables.proxy_add_x_forwarded_for = buffer_bytes(&forwarded);
-        ok = build_upstream_request(
+    int ok =
+        fill_variables(conn, &forwarded, &variables) &&
+        build_upstream_request(
             &conn->to_upstream, &conn->request,
             buffer_bytes(&conn->upstream_uri),
             conn->settings->proxy_http_version, &location->proxy_headers,
-            &variables, buffer_bytes(&conn->from_client) + conn->head_length);
-    }
+            &variables,
+            buffer_bytes(&conn->from_client) + conn->head_length) &&
+        (!key_template || expand_variables(key, key_template, &variables));
     buffer_free(&forwarded);
     return ok;
 }
@@ -469,12 +491,23 @@ static int build_request(Connection *conn) {
 static void connect_upstream(Connection *conn, double now) {
     const char *connecting = "connecting to upstream";
     const Upstream *upstream = conn->location->proxy_pass.upstream;
+    Buffer key;
 
-    if (!build_request(conn)) {
+    buffer_init(&key);
+    int ok = build_request(conn, &key);
+    if (ok) {
+        conn->peer = choose_peer(upstream, conn->remote, buffer_bytes(&key),
+                                 buffer_length(&key));
+    }
+    buffer_free(&key);
+    if (!ok) {
         reply_error(conn, 500, now);
         return;
     }
-    conn->peer = choose_peer(upstream);
+    if (!conn->peer) {
+        upstream_failed(conn, 502, 0, "no live upstreams", connecting, now);
+        return;
+    }
     conn->upstream_io_at = now;
     enter(conn, CONN_CONNECTING);
     if (keepalive_take(upstream, conn->peer, &conn->upstream)) {
@@ -524,6 +557,8 @@ static void upstream_error(Connection *conn, int error_number,
     }
     log_upstream_error(conn, error_number, what, doing);
     close_upstream(conn);
+    release_peer(conn->location->proxy_pass.upstream, conn->peer);
+    conn->peer = NULL;
     buffer_clear(&conn->from_upstream);
     connect_upstream(conn, now);
 }
@@ -1007,6 +1042,7 @@ void conn_start(Connection *conn, int fd, const struct sockaddr_in *peer,
     conn->number = ++connections_accepted;
     conn->client_fd = fd;
     conn->upstream.fd = -1;
+    conn->remote = peer->sin_addr;
     inet_ntop(AF_INET, &peer->sin_addr, conn->remote_addr,
               sizeof(conn->remote_addr));
     conn->requests = 0;

@@ -38,6 +38,7 @@ typedef struct {
     unsigned long long number;  // nginx's *N in the error log.
     int client_fd;
     UpstreamConn upstream;  // From CONN_CONNECTING to CONN_READING_REPLY.
+    struct in_addr remote;  // For ip_hash.
     char remote_addr[INET_ADDRSTRLEN];
     size_t requests;  // On this connection, the current one included.
 
