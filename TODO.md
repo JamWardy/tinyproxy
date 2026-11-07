@@ -5,25 +5,43 @@ How it works is in `DESIGN.md`. The stages are the ones in `../TODO.md`.
 ```
 tinyproxy/
   Makefile
-  main.c          -c, reading the config, starting the loop
-  config.c/.h     the nginx-style config file
-  loop.c/.h       the listening sockets, select() and deadlines
-  conn.c/.h       each connection's state machine
-  request.c/.h    finding and parsing the request's head, with its limits
-  proxy.c/.h      the request as it goes upstream, the reply as it comes
-                  back
-  chunked.c/.h    decoding a chunked reply
-  uri.c/.h        normalising the path, and escaping it again
-  route.c/.h      choosing the server block and the location
-  upstream.c/.h   upstream pools and choosing an endpoint from one
-  keepalive.c/.h  idle upstream connections, kept for the next request
-  hash.c/.h       ip_hash, hash and hash consistent, with CRC32
-  variables.c/.h  $host and the others, for proxy_set_header
-  error_page.c/.h tinyproxy's own replies and nginx's pages
-  http.c/.h       what those share: header types, versions, line helpers
-  buffer.c/.h     growing byte buffers, consumed from the front
-  log.c/.h        the access log and the error log
+  main.c              -c, reading the config, starting the loop
+  config/
+    config.c/.h       loading the nginx-style config file, and freeing it
+    internal.h        what the files below share; not for the rest
+    parse.c           tokens, blocks, and values such as times and sizes
+    directives.c      the directive table and the handlers for
+                      http, server and location blocks
+    upstreams.c       upstream blocks, their hosts and methods, and
+                      linking each proxy_pass to its pool
+    inherit.c         settings inherited block to block, and servers
+                      grouped by the address they listen on
+  core/
+    loop.c/.h         the listening sockets, select() and deadlines
+    conn.c/.h         each connection's state machine
+    route.c/.h        choosing the server block and the location
+  http/
+    request.c/.h      finding and parsing the request's head, with its
+                      limits
+    proxy.c/.h        the request as it goes upstream, the reply as it
+                      comes back
+    chunked.c/.h      decoding and encoding chunked bodies
+    uri.c/.h          normalising the path, and escaping it again
+    error_page.c/.h   tinyproxy's own replies and nginx's pages
+    http.c/.h         what those share: header types, versions, line
+                      helpers
+  balance/
+    upstream.c/.h     upstream pools and choosing an endpoint from one
+    hash.c/.h         ip_hash, hash and hash consistent, with CRC32
+    keepalive.c/.h    idle upstream connections, kept for the next
+                      request
+  util/
+    buffer.c/.h       growing byte buffers, consumed from the front
+    log.c/.h          the access log and the error log
+    variables.c/.h    $host and the others, for proxy_set_header and hash
 ```
+
+- [x] Split `config.c` and move the files into the folders above
 
 ## Stage 1: forwarding
 

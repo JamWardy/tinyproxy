@@ -1,2 +1,7 @@
 -std=c99
 -D_DEFAULT_SOURCE
+-Iconfig
+-Icore
+-Ihttp
+-Ibalance
+-Iutil

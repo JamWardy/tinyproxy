@@ -1,13 +1,21 @@
 CC ?= cc
 # glibc hides POSIX calls such as getaddrinfo under -std=c99 unless asked;
-# macOS shows them anyway. compile_flags.txt repeats these for clangd.
+# macOS shows them anyway. compile_flags.txt repeats these, and the -I flags, for clangd.
 CFLAGS = -std=c99 -Wall -Wextra -Wpedantic -g -D_DEFAULT_SOURCE
 
-SRCS = main.c config.c loop.c conn.c request.c proxy.c chunked.c uri.c \
-       route.c upstream.c keepalive.c hash.c variables.c error_page.c http.c \
-       buffer.c log.c
+DIRS = config core http balance util
+CFLAGS += $(DIRS:%=-I%)
 
-# Objects and .d files go in build/.
+SRCS = main.c \
+       config/config.c config/parse.c config/directives.c \
+       config/upstreams.c config/inherit.c \
+       core/loop.c core/conn.c core/route.c \
+       http/request.c http/proxy.c http/chunked.c http/uri.c \
+       http/error_page.c http/http.c \
+       balance/upstream.c balance/hash.c balance/keepalive.c \
+       util/buffer.c util/log.c util/variables.c
+
+# Objects and .d files go in build/, in the same folders as their sources.
 OBJS = $(SRCS:%.c=build/%.o)
 DEPS = $(OBJS:.o=.d)
 
@@ -19,7 +27,7 @@ tinyproxy: $(OBJS)
 # -MMD -MP write a .d file per object listing the headers it includes,
 # so editing a header rebuilds every .c file that uses it.
 build/%.o: %.c
-	@mkdir -p build
+	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 clean:
