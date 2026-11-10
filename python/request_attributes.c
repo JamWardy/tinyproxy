@@ -50,6 +50,23 @@ static PyObject *get_remote_addr(PyObject *self, void *closure) {
     return to_str_or_none(object->conn->remote_addr);
 }
 
+static PyObject *get_location(PyObject *self, void *closure) {
+    RequestObject *object = (RequestObject *)self;
+
+    (void)closure;
+    if (!check_not_done(object)) {
+        return NULL;
+    }
+    const Location *location = object->conn->location;
+    if (!location) {
+        Py_RETURN_NONE;
+    }
+    if (location->match == LOCATION_EXACT) {
+        return PyUnicode_FromFormat("= %s", location->path);
+    }
+    return to_str_or_none(location->path);
+}
+
 static PyObject *get_headers(PyObject *self, void *closure) {
     RequestObject *object = (RequestObject *)self;
 
@@ -133,6 +150,8 @@ PyGetSetDef REQUEST_ATTRIBUTES[] = {
     {"path", get_path, NULL, "$path: normalised, without the query.", NULL},
     {"query", get_query, NULL, NULL, NULL},
     {"remote_addr", get_remote_addr, NULL, NULL, NULL},
+    {"location", get_location, NULL,
+     "The location's match as written, such as \"= /login\", or None.", NULL},
     {"headers", get_headers, NULL, "The request's (name, value) pairs.",
      NULL},
     {"status", get_status, set_status, NULL, NULL},

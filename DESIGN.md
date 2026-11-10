@@ -461,6 +461,10 @@ Each stage adds nginx's directives for it.
    - `request` is one object for the request's whole life, shared by
      every hook call for it: `request.method`, `request.path` (`$path`),
      `request.query` (`""` if there's none), `request.remote_addr`,
+     `request.location`, the location's match as written, such as
+     `"= /login"` or `"/static/"` (`^~` left off), or `None` before it
+     has one, so a plugin can keep something per location, as Kong
+     does per route (nginx has no variable for it),
      `request.headers` (a tuple of `(name, value)` pairs),
      `request.settings`, a dict, and `request.state`, a dict the hooks
      can keep things in from one phase to the next. `request.status` is
