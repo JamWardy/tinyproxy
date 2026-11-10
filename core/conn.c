@@ -353,11 +353,33 @@ static void log_upstream_error(const Connection *conn, int error_number,
     }
 }
 
-// Something went wrong upstream before the reply's head was in.
+// Something went wrong upstream before the reply's head was in, that
+// isn't the endpoint's failure.
 static void fail_upstream(Connection *conn, int status, int error_number,
                           const char *what, const char *doing,
                           double now) {
     log_upstream_error(conn, error_number, what, doing);
+    send_error(conn, status, now);
+}
+
+// The endpoint failed this request, as passive health checks count it:
+// logs why, and gives it back as failed.
+static void count_failure(Connection *conn, int error_number,
+                          const char *what, const char *doing, double now) {
+    log_upstream_error(conn, error_number, what, doing);
+    if (endpoint_failed(conn->location->proxy_pass.upstream, conn->endpoint,
+                        now)) {
+        log_conn(conn, "warn",
+                 "upstream server temporarily disabled while %s", doing);
+    }
+    conn->endpoint = NULL;
+}
+
+// The endpoint failed before the reply's head was in.
+static void fail_endpoint(Connection *conn, int status, int error_number,
+                          const char *what, const char *doing,
+                          double now) {
+    count_failure(conn, error_number, what, doing, now);
     send_error(conn, status, now);
 }
 
@@ -502,7 +524,7 @@ static void connect_upstream(Connection *conn, double now) {
     if (ok) {
         conn->endpoint = choose_endpoint(upstream, conn->remote_ip,
                                          buffer_bytes(&key),
-                                         buffer_length(&key));
+                                         buffer_length(&key), now);
     }
     buffer_free(&key);
     if (!ok) {
@@ -540,7 +562,7 @@ static void connect_upstream(Connection *conn, double now) {
     if (connect(fd, (const struct sockaddr *)address, sizeof(*address)) == 0) {
         set_state(conn, CONN_SENDING_REQUEST);
     } else if (errno != EINPROGRESS) {
-        fail_upstream(conn, 502, errno, "connect() failed", connecting, now);
+        fail_endpoint(conn, 502, errno, "connect() failed", connecting, now);
     }
 }
 
@@ -558,13 +580,13 @@ static void retry_or_fail_upstream(Connection *conn, int error_number,
                                    double now) {
     if (conn->upstream.requests == 1 ||
         !is_idempotent(conn->request.method)) {
-        fail_upstream(conn, 502, error_number, what, doing, now);
+        fail_endpoint(conn, 502, error_number, what, doing, now);
         return;
     }
-    log_upstream_error(conn, error_number, what, doing);
+    // Counted, as nginx does, though the endpoint may only have closed an
+    // idle connection.
+    count_failure(conn, error_number, what, doing, now);
     close_upstream(conn);
-    release_endpoint(conn->location->proxy_pass.upstream, conn->endpoint);
-    conn->endpoint = NULL;
     buffer_clear(&conn->from_upstream);
     connect_upstream(conn, now);
 }
@@ -786,7 +808,7 @@ static void finish_connecting(Connection *conn, double now) {
         error_number = errno;
     }
     if (error_number) {
-        fail_upstream(conn, 502, error_number, "connect() failed",
+        fail_endpoint(conn, 502, error_number, "connect() failed",
                       "connecting to upstream", now);
         return;
     }
@@ -925,7 +947,7 @@ static void read_reply_head(Connection *conn, double now) {
     size_t head = find_reply_head(buffer_bytes(in), buffer_length(in));
     if (head == 0 ? buffer_length(in) > REPLY_HEAD_LIMIT
                   : head > REPLY_HEAD_LIMIT) {
-        fail_upstream(conn, 502, 0, "upstream sent too big header",
+        fail_endpoint(conn, 502, 0, "upstream sent too big header",
                       reading, now);
         return;
     }
@@ -937,7 +959,7 @@ static void read_reply_head(Connection *conn, double now) {
     int status = parse_reply_head(buffer_bytes(in), head, to_head,
                                   &conn->reply);
     if (status) {
-        fail_upstream(conn, status, 0, "upstream sent invalid header",
+        fail_endpoint(conn, status, 0, "upstream sent invalid header",
                       reading, now);
         return;
     }
@@ -1262,7 +1284,7 @@ int conn_deadline(const Connection *conn, double *at) {
 
 static void upstream_timed_out(Connection *conn, const char *doing,
                                double now) {
-    fail_upstream(conn, 504, ETIMEDOUT, "upstream timed out", doing, now);
+    fail_endpoint(conn, 504, ETIMEDOUT, "upstream timed out", doing, now);
 }
 
 void conn_expire(Connection *conn, double now) {

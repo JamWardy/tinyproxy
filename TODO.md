@@ -120,7 +120,7 @@ tinyproxy/
         connection reused across clients, a service restarted under
         tinyproxy (a `GET` sent again, a `POST` getting `502`), and
         idle connections timing out on both sides
-- [ ] 6: load balancing, as in `DESIGN.md`:
+- [x] 6: load balancing, as in `DESIGN.md`:
   - [x] `weight=`, `down` and `max_conns=` on a `host`, and
         `least_conn`, `ip_hash` and `hash`, with their errors and the
         `load balancing method redefined` warning
@@ -137,7 +137,7 @@ tinyproxy/
         ketama ring, in `hash.c`; the key is expanded per request in
         `conn.c`
   - [x] `down`, `max_conns=`, the 20 tries and the `502`
-  - [ ] Try it by hand: two tinyhttp echoes with `weight=3` and
+  - [x] Try it by hand: two tinyhttp echoes with `weight=3` and
         `weight=1`, the order in their logs; `least_conn` with a slow
         request holding one; `ip_hash` from two client addresses
         (`127.0.0.1` and `127.0.0.2`); `hash $remote_addr` and
@@ -146,7 +146,21 @@ tinyproxy/
         (`502`); `keepalive_max_idle` reusing each endpoint's
         connections; a host with two addresses; each config error and
         the warning
-- [ ] 7: `max_fails`, `fail_timeout` and `backup`
+- [x] 7: passive health checks, as in `DESIGN.md`:
+  - [x] `max_fails=`, `fail_timeout=` and `backup` on a `host`, and
+        `backup` refused with `hash` and `ip_hash`
+  - [x] Each endpoint's failures, its skipping and test request, its
+        effective weight, and the reset when none is left, in
+        `balance/upstream.c`
+  - [x] Backups, chosen when no other endpoint can be, for round robin
+        and `least_conn`
+  - [x] Reporting each failure from `core/conn.c`, with the `[warn]`
+  - [x] Try it by hand: two echo services with one stopped (the
+        failure, the warning, the other taking every request, the test
+        request after `fail_timeout`, sharing again once it's back);
+        `max_fails=3`; `max_fails=0`; a pool of one never skipped;
+        `backup` taking over and handing back; all stopped (`502` and
+        the reset); `backup` with `hash` refused
 - [x] Clearer names, as `DESIGN.md`'s Terms say: `host` for nginx's
       upstream `server`, endpoints for its peers, the renamed keepalive
       directives, `client_send_timeout`, and `$path_and_query`, `$path`

@@ -75,9 +75,23 @@ int handle_upstream(Parser *parser, const Scope *scope,
     if (!parse_block(parser, &inner)) {
         return 0;
     }
-    if (upstream->endpoint_count == 0) {
+    // Backups are only for when the others can't be used, so some must
+    // be others, as in nginx.
+    size_t primaries = 0;
+    for (size_t i = 0; i < upstream->endpoint_count; i++) {
+        primaries += !upstream->endpoints[i].backup;
+    }
+    if (primaries == 0) {
         return parse_error(parser, directive->line,
                            "no hosts are inside upstream");
+    }
+    // A hash must always land on the same endpoints for a key.
+    BalanceKind kind = upstream->method.kind;
+    if (written.backup_line > 0 &&
+        (kind == BALANCE_IP_HASH || kind == BALANCE_HASH ||
+         kind == BALANCE_HASH_CONSISTENT)) {
+        return parse_error(parser, written.backup_line,
+                           "invalid parameter \"backup\"");
     }
 
     UpstreamKeepalive *keepalive = &upstream->keepalive;
@@ -97,7 +111,8 @@ int handle_upstream(Parser *parser, const Scope *scope,
     return 1;
 }
 
-// weight=, max_conns= or down on a host, into options.
+// weight=, max_conns=, down, max_fails=, fail_timeout= or backup on a host,
+// into options.
 static int take_host_option(Parser *parser, const Directive *directive,
                             const char *option, Endpoint *options) {
     if (strncmp(option, "weight=", 7) == 0) {
@@ -117,12 +132,21 @@ static int take_host_option(Parser *parser, const Directive *directive,
         options->down = 1;
         return 1;
     }
-    if (strncmp(option, "max_fails=", 10) == 0 ||
-        strncmp(option, "fail_timeout=", 13) == 0 ||
-        strcmp(option, "backup") == 0) {
-        return parse_error(parser, directive->line,
-                           "\"%.*s\" is not supported until stage 7",
-                           (int)strcspn(option, "="), option);
+    if (strncmp(option, "max_fails=", 10) == 0) {
+        if (!parse_count(option + 10, &options->max_fails)) {
+            return invalid_parameter(parser, directive, option);
+        }
+        return 1;
+    }
+    if (strncmp(option, "fail_timeout=", 13) == 0) {
+        if (!parse_seconds(option + 13, &options->fail_timeout)) {
+            return invalid_parameter(parser, directive, option);
+        }
+        return 1;
+    }
+    if (strcmp(option, "backup") == 0) {
+        options->backup = 1;
+        return 1;
     }
     return invalid_parameter(parser, directive, option);
 }
@@ -134,6 +158,8 @@ static Endpoint default_host_options(const char *host) {
     memset(&options, 0, sizeof(options));
     options.host = host;
     options.weight = 1;
+    options.max_fails = DEFAULT_MAX_FAILS;
+    options.fail_timeout = DEFAULT_FAIL_TIMEOUT;
     return options;
 }
 
@@ -158,6 +184,9 @@ int handle_host(Parser *parser, const Scope *scope,
         !split_host_port(address, name, &port)) {
         return parse_error(parser, directive->line,
                            "invalid port in upstream \"%s\"", address);
+    }
+    if (options.backup && scope->upstream_settings->backup_line == 0) {
+        scope->upstream_settings->backup_line = directive->line;
     }
     switch (upstream_add_host(scope->upstream, name, port, &options)) {
         case HOST_RESOLVED:
@@ -195,8 +224,8 @@ int handle_plain_method(Parser *parser, const Scope *scope,
     (void)spec;
     set_method(parser, scope, directive,
                strcmp(directive->name, "least_conn") == 0
-               ? BALANCE_LEAST_CONN
-               : BALANCE_IP_HASH,
+                   ? BALANCE_LEAST_CONN
+                   : BALANCE_IP_HASH,
                NULL);
     return 1;
 }

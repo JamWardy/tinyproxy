@@ -16,6 +16,8 @@
 #define DEFAULT_UPSTREAM_KEEPALIVE_TIMEOUT 60.0
 #define DEFAULT_KEEPALIVE_MAX_REQUESTS 1000
 #define DEFAULT_KEEPALIVE_LIFETIME 3600.0
+#define DEFAULT_MAX_FAILS 1
+#define DEFAULT_FAIL_TIMEOUT 10.0
 
 typedef enum {
     CONTEXT_MAIN = 1,
@@ -59,6 +61,7 @@ typedef enum {
 // Upstream.
 typedef struct {
     UpstreamLast last;
+    size_t backup_line;  // The first host marked backup, or 0.
     OptionalCount keepalive_max_idle;
     OptionalSeconds keepalive_timeout;
     OptionalCount keepalive_max_requests;

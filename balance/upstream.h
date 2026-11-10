@@ -13,6 +13,9 @@ typedef struct {
     size_t weight;
     size_t max_conns;  // 0 for no limit.
     int down;
+    size_t max_fails;  // 0 never skips it.
+    double fail_timeout;
+    int backup;  // Only for when no other endpoint can be used.
 } Endpoint;
 
 typedef enum {
@@ -73,14 +76,21 @@ void upstream_free(Upstream *upstream);
 int balancers_init(Upstream *const *upstreams, size_t count);
 void balancers_free(void);
 
-// The endpoint for the next request, by the pool's method, counted as
-// active until release_endpoint. client is the client's address, for
-// ip_hash, and key the hash's key with its variables filled. NULL if none
-// can be used.
+// The endpoint for the next request, by the pool's method, or else a
+// backup, counted as active until release_endpoint or endpoint_failed.
+// client is the client's address, for ip_hash, and key the hash's key with
+// its variables filled. NULL if none can be used.
 const Endpoint *choose_endpoint(const Upstream *upstream,
                                 struct in_addr client, const char *key,
-                                size_t key_length);
+                                size_t key_length, double now);
 
+// The request is done with it, without its failing.
 void release_endpoint(const Upstream *upstream, const Endpoint *endpoint);
+
+// The request is done with it, and it failed, as passive health checks
+// count failures. Returns whether that's its max_fails'th, so it's now
+// skipped for fail_timeout.
+int endpoint_failed(const Upstream *upstream, const Endpoint *endpoint,
+                    double now);
 
 #endif

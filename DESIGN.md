@@ -354,13 +354,39 @@ Each stage adds nginx's directives for it.
      `keepalive_max_idle` in the block also turns it off for the pool,
      with the same warning, as nginx's docs say to write the method
      first.
-7. **Passive health checks:** `max_fails` (1) and `fail_timeout`
-   (10 s) on a `host`: after `max_fails` failures within
-   `fail_timeout`, an endpoint is skipped for `fail_timeout`. With none
-   left, the client gets `502`. `backup` on a `host` keeps its
-   endpoints for when every other one is skipped or `down`, and stops
-   it starting with `hash` or `ip_hash`, as in nginx. Active checks are
-   the gateway's.
+7. **Passive health checks:** as nginx's, an endpoint that fails
+   requests is skipped for a while. tinyproxy learns this from the
+   requests themselves, without probing; active checks, which probe
+   each endpoint on a timer, are the gateway's.
+   - A failure is an error or a timeout while connecting, sending the
+     request or reading the reply's head, or a head that isn't HTTP or
+     is too big: the upstream's own `502`s and `504`s. A `500` reply
+     isn't one (stage 12 can add it), and nor is an error after the
+     head, or tinyproxy's own trouble, such as running out of
+     descriptors. An error on a reused idle connection counts too,
+     before stage 5 sends the request again, as in nginx.
+   - `max_fails=N` (1) and `fail_timeout=T` (10 s) on a `host`: once an
+     endpoint has `max_fails` failures, it's skipped for
+     `fail_timeout`, with nginx's `[warn] upstream server temporarily
+     disabled while connecting to upstream` (or whatever it was doing).
+     Then one request is let through to test it: if it succeeds, the
+     count goes back to 0; if it fails, the endpoint is skipped for
+     another `fail_timeout`. `max_fails=0` never skips it.
+   - Each failure also lowers the endpoint's weight in round robin by
+     `weight / max_fails`, and it climbs back by 1 with each request
+     after, so a recovered endpoint gets its share back gradually, as
+     nginx's effective weight does.
+   - A pool with only one endpoint, and no backup, never skips it, as
+     in nginx: there's nowhere else to send the request, so a blip would
+     only turn into `502`s for `fail_timeout`.
+   - With every endpoint skipped, `down` or full, the client gets `502`
+     and the error log `no live upstreams`, and every endpoint's count
+     goes back to 0, so the next request tries them all again.
+   - `backup` on a `host` keeps its endpoints for when every other one
+     is skipped, `down` or full; among them, the pool's method chooses
+     as usual. It stops tinyproxy starting with `hash` or `ip_hash`
+     (`invalid parameter "backup"`), whose keys must always land on the
+     same endpoints.
 8. **Phases:** hooks at nginx's phases, which the gateway's Python
    runs in, as OpenResty's `*_by_lua` directives do: access (allow it,
    or answer here), balancer (pick the endpoint), header filter, body
