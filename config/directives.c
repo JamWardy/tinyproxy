@@ -37,6 +37,7 @@ int check_variables(Parser *parser, const Directive *directive,
 void block_settings_init(BlockSettings *settings) {
     memset(settings, 0, sizeof(*settings));
     settings->proxy_set_headers.items = NULL;
+    settings->python_settings.items = NULL;
     settings->access_log.kind = ACCESS_LOG_UNSET;
 }
 
@@ -338,6 +339,20 @@ static int handle_proxy_pass(Parser *parser, const Scope *scope,
 
 // ---- Settings ----
 
+static int add_pair(Parser *parser, const Directive *directive,
+                    Headers *pairs) {
+    Header *items = realloc(pairs->items, (pairs->count + 1) * sizeof(Header));
+
+    if (!items) {
+        return out_of_memory(parser, directive);
+    }
+    pairs->items = items;
+    pairs->items[pairs->count].name = directive->arguments[0];
+    pairs->items[pairs->count].value = directive->arguments[1];
+    pairs->count++;
+    return 1;
+}
+
 static int handle_proxy_set_header(Parser *parser, const Scope *scope,
                                    const Directive *directive,
                                    const DirectiveSpec *spec) {
@@ -347,15 +362,44 @@ static int handle_proxy_set_header(Parser *parser, const Scope *scope,
     if (!check_variables(parser, directive, directive->arguments[1])) {
         return 0;
     }
-    Header *items = realloc(headers->items,
-                            (headers->count + 1) * sizeof(Header));
-    if (!items) {
-        return out_of_memory(parser, directive);
+    return add_pair(parser, directive, headers);
+}
+
+static int handle_python_setting(Parser *parser, const Scope *scope,
+                             const Directive *directive,
+                             const DirectiveSpec *spec) {
+    Headers *settings = &scope->settings->python_settings;
+
+    (void)spec;
+    for (size_t i = 0; i < settings->count; i++) {
+        if (strcmp(settings->items[i].name, directive->arguments[0]) == 0) {
+            return duplicate(parser, directive);
+        }
     }
-    headers->items = items;
-    headers->items[headers->count].name = directive->arguments[0];
-    headers->items[headers->count].value = directive->arguments[1];
-    headers->count++;
+    return add_pair(parser, directive, settings);
+}
+
+static int handle_python_path(Parser *parser, const Scope *scope,
+                              const Directive *directive,
+                              const DirectiveSpec *spec) {
+    (void)scope;
+    (void)spec;
+    if (parser->config->python_path) {
+        return duplicate(parser, directive);
+    }
+    parser->config->python_path = directive->arguments[0];
+    return 1;
+}
+
+static int handle_python_module(Parser *parser, const Scope *scope,
+                                const Directive *directive,
+                                const DirectiveSpec *spec) {
+    (void)scope;
+    (void)spec;
+    if (parser->config->python_module) {
+        return duplicate(parser, directive);
+    }
+    parser->config->python_module = directive->arguments[0];
     return 1;
 }
 
@@ -527,6 +571,9 @@ static const DirectiveSpec DIRECTIVES[] = {
     {"proxy_pass", CONTEXT_LOCATION, 0, 1, 1, handle_proxy_pass, 0},
     {"proxy_set_header", ANY_HTTP_BLOCK, 0, 2, 2, handle_proxy_set_header, 0},
     {"access_log", ANY_HTTP_BLOCK, 0, 1, 2, handle_access_log, 0},
+    {"python_path", CONTEXT_HTTP, 0, 1, 1, handle_python_path, 0},
+    {"python_module", CONTEXT_HTTP, 0, 1, 1, handle_python_module, 0},
+    {"python_setting", ANY_HTTP_BLOCK, 0, 2, 2, handle_python_setting, 0},
     {"client_max_body_size", ANY_HTTP_BLOCK, 0, 1, 1, handle_size,
      offsetof(BlockSettings, client_max_body_size)},
     {"proxy_http_version", ANY_HTTP_BLOCK, 0, 1, 1, handle_http_version, 0},

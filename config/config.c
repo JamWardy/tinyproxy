@@ -92,6 +92,7 @@ int config_load(Config *config, const char *path, char *error,
 
 static void block_settings_free(BlockSettings *settings) {
     free(settings->proxy_set_headers.items);
+    free(settings->python_settings.items);
     if (settings->access_log.kind == ACCESS_LOG_FILE) {
         close(settings->access_log.fd);
     }
@@ -115,11 +116,13 @@ void config_free(Config *config) {
         for (size_t j = 0; j < server->location_count; j++) {
             free(server->locations[j].proxy_pass.host);
             free(server->locations[j].proxy_headers.items);
+            free(server->locations[j].settings.python_settings.items);
             block_settings_free(&server->locations[j].written);
         }
         free(server->locations);
         free(server->listens);
         free(server->names);
+        free(server->settings.python_settings.items);
         block_settings_free(&server->written);
     }
     free(config->servers);

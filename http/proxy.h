@@ -21,13 +21,15 @@
 int build_upstream_uri(Buffer *out, const Request *request,
                        const Location *location);
 
-// The request as it goes upstream, for uri: proxy_headers first, with their
-// variables filled in and any that come out empty left off, then the
-// client's headers that none of them replace, then the body. Every variable
-// in proxy_headers must already have been checked. Fails only when out of
-// memory.
+// The request as it goes upstream, for uri: the access hook's headers
+// first, with any empty ones left off, then proxy_headers that they don't
+// replace, with their variables filled in and any that come out empty left
+// off, then the client's headers that neither replaces, then the body.
+// Every variable in proxy_headers must already have been checked. Fails
+// only when out of memory.
 int build_upstream_request(Buffer *out, const Request *request,
                            const char *uri, int version,
+                           const Headers *headers_from_access,
                            const Headers *proxy_headers,
                            const Variables *variables, const char *body);
 
@@ -61,12 +63,33 @@ typedef enum {
     REWRITE_NONE,
     REWRITE_DECHUNK,  // Out of chunks, for a client that can't read them.
     REWRITE_CHUNK,    // Into chunks, as it has no length of its own.
+    // Through the body filter, whose length can't be known, so into chunks,
+    // or for a client that can't read them, ending at the close.
+    REWRITE_FILTER_CHUNK,
+    REWRITE_FILTER_TO_CLOSE,
 } BodyRewrite;
 
-// A head that parse_reply_head took, as the client gets it: with
-// tinyproxy's own Server and Date, the Transfer-Encoding rewrite needs, and
-// connection, the Connection header lines. Fails only when out of memory.
-int write_reply_head(Buffer *out, const char *head, size_t length,
-                     BodyRewrite rewrite, const char *connection);
+// A head that parse_reply_head took, cut up.
+typedef struct {
+    char *storage;  // A copy of the head, which the strings point into.
+    int status;
+    const char *status_text;  // "200 OK".
+    // As they came, but for Server, Date, Connection and Keep-Alive, which
+    // are tinyproxy's own.
+    Headers headers;
+} ParsedReplyHead;
+
+// Fails only when out of memory.
+int split_reply_head(ParsedReplyHead *parsed, const char *head, size_t length);
+void parsed_reply_head_free(ParsedReplyHead *parsed);
+
+// The head as the client gets it: status, with the upstream's words if it's
+// the upstream's status; tinyproxy's own Server and Date; headers, but for
+// Content-Length and Transfer-Encoding, which are parsed's own, as rewrite
+// needs them, as they say where the body ends; then connection, the
+// Connection header lines. Fails only when out of memory.
+int write_reply_head(Buffer *out, int status, const ParsedReplyHead *parsed,
+                     const Headers *headers, BodyRewrite rewrite,
+                     const char *connection);
 
 #endif

@@ -35,6 +35,16 @@ tinyproxy/
     hash.c/.h         ip_hash, hash and hash consistent, with CRC32
     keepalive.c/.h    idle upstream connections, kept for the next
                       request
+  python/
+    embed.c/.h        the interpreter, and calling each phase's hook
+    request_object.c/.h
+                      the request object, as the hooks see the
+                      request: its type and its life
+    request_attributes.c
+                      its attributes, such as request.path
+    request_methods.c its methods, such as request.respond()
+    convert.c/.h      values between C and Python, checked when they
+                      come from a hook
   util/
     buffer.c/.h       growing byte buffers, consumed from the front
     log.c/.h          the access log and the error log
@@ -168,8 +178,39 @@ tinyproxy/
 
 ## Stage 8: phases
 
-- [ ] Embed Python, and call its hooks at the phases in `DESIGN.md`
-- [ ] `error_page` to a hook
+As in `DESIGN.md`:
+
+- [x] Python's flags in the `Makefile` and `compile_flags.txt`
+- [x] `python_path`, `python_module` and `python_setting`, with their
+      errors and `python_setting`'s inheriting
+- [x] The interpreter, importing the module, finding its hooks, `init`,
+      and tracebacks to the error log, in `python/embed.c`
+- [x] `request`, the request as the hooks see it, with what each phase may
+      change, in `python/request_object.c`
+- [x] Calling each hook from `core/conn.c`: `access` with `set_header`
+      and `respond`; `balancer`, with a `use_endpoint` in
+      `balance/upstream.c` that counts the one it returns; `header_filter`;
+      `body_filter`, with the filtered reply chunked or ending at the
+      close; `log`; and `error` in place of tinyproxy's page
+- [x] Try it by hand: a module with every hook printing what it gets;
+      `access` adding a header the echo service sees, removing one, and
+      answering `401`; `balancer` choosing an endpoint and returning
+      `None`; `header_filter` changing the status and a header;
+      `body_filter` upper-casing a body to HTTP/1.1 and HTTP/1.0;
+      `error` for a `404` and a `502`; each hook raising; a module that
+      won't import; `python_setting` inherited and replaced
+- [x] `header_filter` and `body_filter` on tinyproxy's own replies too,
+      as `DESIGN.md`'s "Its own replies too" says: `own_page_reply` in
+      `http/error_page.c`, and `filter_own_reply` in `core/conn.c`
+- [x] Try it by hand: a header and an upper-cased body added to a
+      `respond` reply, an `error` reply, tinyproxy's own `404` page, a
+      `301` and a `400` that couldn't be read; a status changed; a
+      `HEAD`; each filter raising, giving a Problem Details `500` once
+- [x] `python_setting` inherited by name, as `DESIGN.md` says, in
+      `config/inherit.c`
+- [x] Try it by hand: a name set in `http`, `server` and `location`,
+      each replacing the one outside; a location setting one name and
+      keeping the server's others; an empty value
 
 ## Stages 11 to 13
 

@@ -84,6 +84,11 @@ const Endpoint *choose_endpoint(const Upstream *upstream,
                                 struct in_addr client, const char *key,
                                 size_t key_length, double now);
 
+// Counts a request for endpoint, chosen by other means, such as the balancer
+// hook, as choose_endpoint counts its own.
+void use_endpoint(const Upstream *upstream, const Endpoint *endpoint,
+                  double now);
+
 // The request is done with it, without its failing.
 void release_endpoint(const Upstream *upstream, const Endpoint *endpoint);
 

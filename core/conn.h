@@ -68,6 +68,15 @@ typedef struct {
     BodyRewrite body_rewrite;
     ChunkDecoder chunks;  // REPLY_CHUNKED's.
     int keep_client;  // The reply keeps the client's connection.
+    // The filters have run for this request, so the 500 after one raised
+    // skips them, rather than raising again.
+    int filtered;
+
+    // The request object, once a hook has needed it; its type is Python's,
+    // in python/.
+    struct RequestObject *request_object;
+    // From request.set_header, owning their strings.
+    Headers headers_from_access;
 
     int status;                // What the access log shows.
     size_t reply_head_length;  // So the log can count only the body.

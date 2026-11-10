@@ -61,21 +61,35 @@ int build_upstream_uri(Buffer *out, const Request *request,
 
 int build_upstream_request(Buffer *out, const Request *request,
                            const char *uri, int version,
+                           const Headers *headers_from_access,
                            const Headers *proxy_headers,
                            const Variables *variables, const char *body) {
     if (!buffer_appendf(out, "%s %s HTTP/%d.%d\r\n", request->method, uri,
                         version / 1000, version % 1000)) {
         return 0;
     }
+    for (size_t i = 0; i < headers_from_access->count; i++) {
+        const Header *header = &headers_from_access->items[i];
+
+        if (*header->value &&
+            !append_header(out, header->name, header->value,
+                           strlen(header->value))) {
+            return 0;
+        }
+    }
     for (size_t i = 0; i < proxy_headers->count; i++) {
-        if (!append_proxy_header(out, &proxy_headers->items[i], variables)) {
+        const Header *header = &proxy_headers->items[i];
+
+        if (!is_replaced(headers_from_access, header->name) &&
+            !append_proxy_header(out, header, variables)) {
             return 0;
         }
     }
     for (size_t i = 0; i < request->header_count; i++) {
         const Header *header = &request->headers[i];
 
-        if (!is_replaced(proxy_headers, header->name) &&
+        if (!is_replaced(headers_from_access, header->name) &&
+            !is_replaced(proxy_headers, header->name) &&
             !append_header(out, header->name, header->value,
                            strlen(header->value))) {
             return 0;
@@ -250,45 +264,99 @@ int parse_reply_head(const char *head, size_t length, int to_head,
     return result;
 }
 
-static int copy_reply_headers(Buffer *out, char *cursor,
-                              const char *status_text, BodyRewrite rewrite,
-                              const char *connection) {
-    char date[40];
+int split_reply_head(ParsedReplyHead *parsed, const char *head,
+                     size_t length) {
+    char *cursor;
     char *name;
     char *value;
+    int version;
 
-    format_http_date(date, sizeof(date));
-    if (!buffer_appendf(out, "HTTP/1.1 %s\r\nServer: tinyproxy\r\n"
-                             "Date: %s\r\n", status_text, date)) {
+    parsed->headers.items = NULL;
+    parsed->headers.count = 0;
+    // parse_reply_head checked every line.
+    if (open_head(head, length, &parsed->storage, &cursor, &version,
+                  &parsed->status, &parsed->status_text) != 0) {
+        parsed_reply_head_free(parsed);
         return 0;
     }
-    // parse_reply_head checked every line.
     while (next_header(&cursor, &name, &value) == 1) {
-        int dropped = is_hidden(name) ||
-                      (rewrite == REWRITE_DECHUNK &&
-                       strcasecmp(name, "Transfer-Encoding") == 0);
-
-        if (!dropped && !append_header(out, name, value, strlen(value))) {
+        if (is_hidden(name)) {
+            continue;
+        }
+        Header *items = realloc(parsed->headers.items,
+                                (parsed->headers.count + 1) * sizeof(Header));
+        if (!items) {
+            parsed_reply_head_free(parsed);
             return 0;
         }
+        parsed->headers.items = items;
+        items[parsed->headers.count].name = name;
+        items[parsed->headers.count].value = value;
+        parsed->headers.count++;
     }
-    return (rewrite != REWRITE_CHUNK ||
+    return 1;
+}
+
+void parsed_reply_head_free(ParsedReplyHead *parsed) {
+    free(parsed->storage);
+    free(parsed->headers.items);
+    parsed->storage = NULL;
+    parsed->headers.items = NULL;
+    parsed->headers.count = 0;
+}
+
+static int is_framing(const char *name) {
+    return strcasecmp(name, "Content-Length") == 0 ||
+           strcasecmp(name, "Transfer-Encoding") == 0;
+}
+
+// The upstream's own Content-Length and Transfer-Encoding, unless rewrite
+// replaces them.
+static int keeps_framing(const char *name, BodyRewrite rewrite) {
+    switch (rewrite) {
+        case REWRITE_NONE:
+        case REWRITE_CHUNK:
+            return 1;
+        case REWRITE_DECHUNK:
+            return strcasecmp(name, "Transfer-Encoding") != 0;
+        case REWRITE_FILTER_CHUNK:
+        case REWRITE_FILTER_TO_CLOSE:
+            return 0;
+    }
+    return 1;
+}
+
+int write_reply_head(Buffer *out, int status, const ParsedReplyHead *parsed,
+                     const Headers *headers, BodyRewrite rewrite,
+                     const char *connection) {
+    char date[40];
+
+    format_http_date(date, sizeof(date));
+    int ok = status == parsed->status
+                 ? buffer_appendf(out, "HTTP/1.1 %s\r\n", parsed->status_text)
+                 : buffer_appendf(out, "HTTP/1.1 %d %s\r\n", status,
+                                  status_reason(status));
+    ok = ok && buffer_appendf(out, "Server: tinyproxy\r\nDate: %s\r\n",
+                              date);
+    for (size_t i = 0; ok && i < headers->count; i++) {
+        const Header *header = &headers->items[i];
+
+        if (!is_framing(header->name) && !is_hidden(header->name)) {
+            ok = append_header(out, header->name, header->value,
+                               strlen(header->value));
+        }
+    }
+    for (size_t i = 0; ok && i < parsed->headers.count; i++) {
+        const Header *header = &parsed->headers.items[i];
+
+        if (is_framing(header->name) && keeps_framing(header->name, rewrite)) {
+            ok = append_header(out, header->name, header->value,
+                               strlen(header->value));
+        }
+    }
+    return ok &&
+           (!(rewrite == REWRITE_CHUNK || rewrite == REWRITE_FILTER_CHUNK) ||
             buffer_append_text(out, "Transfer-Encoding: chunked\r\n")) &&
            buffer_append_text(out, connection) &&
            buffer_append(out, "\r\n", 2);
-}
-
-int write_reply_head(Buffer *out, const char *head, size_t length,
-                     BodyRewrite rewrite, const char *connection) {
-    char *copy;
-    char *cursor;
-    int version;
-    int code;
-    const char *status_text;
-    int ok = open_head(head, length, &copy, &cursor, &version, &code,
-                       &status_text) == 0 &&
-             copy_reply_headers(out, cursor, status_text, rewrite, connection);
-
-    free(copy);
-    return ok;
 }

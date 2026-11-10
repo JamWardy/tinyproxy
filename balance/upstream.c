@@ -338,16 +338,6 @@ static const Endpoint *pick_backup(Balancer *balancer, double now) {
     return round_robin(balancer, backups, now);
 }
 
-static void use_endpoint(const Upstream *upstream, const Endpoint *endpoint,
-                  double now) {
-    EndpointLoad *load = load_of(&balancers[upstream->index], endpoint);
-
-    load->active++;
-    if (now - load->checked_at > endpoint->fail_timeout) {
-        load->checked_at = now;
-    }
-}
-
 const Endpoint *choose_endpoint(const Upstream *upstream,
                                 struct in_addr client, const char *key,
                                 size_t key_length, double now) {
@@ -366,6 +356,16 @@ const Endpoint *choose_endpoint(const Upstream *upstream,
     }
     use_endpoint(upstream, endpoint, now);
     return endpoint;
+}
+
+void use_endpoint(const Upstream *upstream, const Endpoint *endpoint,
+                  double now) {
+    EndpointLoad *load = load_of(&balancers[upstream->index], endpoint);
+
+    load->active++;
+    if (now - load->checked_at > endpoint->fail_timeout) {
+        load->checked_at = now;
+    }
 }
 
 void release_endpoint(const Upstream *upstream, const Endpoint *endpoint) {

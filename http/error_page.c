@@ -2,7 +2,8 @@
 
 #include <assert.h>
 
-#include "http.h"
+#include <string.h>
+#include <strings.h>
 
 typedef struct {
     int status;
@@ -40,42 +41,79 @@ static const ErrorPage *find_error_page(int status) {
     return NULL;
 }
 
-int build_own_reply(Buffer *out, int status, int with_body,
-                    const char *location, const char *connection) {
+int own_page_reply(HookReply *reply, int status, const char *location) {
     const ErrorPage *page = find_error_page(status);
-    char date[40];
-    Buffer html;
 
     assert(page);
-    buffer_init(&html);
-    int ok = buffer_appendf(&html,
-                            "<html>\r\n"
-                            "<head><title>%s</title></head>\r\n"
-                            "<body>\r\n"
-                            "<center><h1>%s</h1></center>\r\n",
-                            page->title, page->status_line) &&
-             (!page->detail ||
-              buffer_appendf(&html, "<center>%s</center>\r\n",
-                             page->detail)) &&
-             buffer_append_text(&html, "<hr><center>tinyproxy</center>\r\n"
-                                       "</body>\r\n"
-                                       "</html>\r\n");
+    reply->status = status == STATUS_HEADER_TOO_LARGE ? 400 : status;
+    reply->status_line = page->status_line;
+    return headers_add_copy(&reply->headers, "Content-Type", "text/html") &&
+           (!location ||
+            headers_add_copy(&reply->headers, "Location", location)) &&
+           buffer_appendf(&reply->body,
+                          "<html>\r\n"
+                          "<head><title>%s</title></head>\r\n"
+                          "<body>\r\n"
+                          "<center><h1>%s</h1></center>\r\n",
+                          page->title, page->status_line) &&
+           (!page->detail ||
+            buffer_appendf(&reply->body, "<center>%s</center>\r\n",
+                           page->detail)) &&
+           buffer_append_text(&reply->body, "<hr><center>tinyproxy</center>\r\n"
+                                            "</body>\r\n"
+                                            "</html>\r\n");
+}
+
+void hook_reply_init(HookReply *reply) {
+    reply->status = 0;
+    reply->status_line = NULL;
+    reply->headers.items = NULL;
+    reply->headers.count = 0;
+    buffer_init(&reply->body);
+}
+
+void hook_reply_free(HookReply *reply) {
+    headers_free_copies(&reply->headers);
+    buffer_free(&reply->body);
+}
+
+// What tinyproxy writes itself, so a hook's would be a second one.
+static int is_own_header(const char *name) {
+    return strcasecmp(name, "Server") == 0 || strcasecmp(name, "Date") == 0 ||
+           strcasecmp(name, "Content-Length") == 0 ||
+           strcasecmp(name, "Transfer-Encoding") == 0 ||
+           strcasecmp(name, "Connection") == 0 ||
+           strcasecmp(name, "Keep-Alive") == 0;
+}
+
+int build_hook_reply(Buffer *out, const HookReply *reply, int with_body,
+                     const char *connection) {
+    char date[40];
 
     format_http_date(date, sizeof(date));
-    ok = ok && buffer_appendf(out,
-                              "HTTP/1.1 %s\r\n"
-                              "Server: tinyproxy\r\n"
-                              "Date: %s\r\n"
-                              "Content-Type: text/html\r\n"
-                              "Content-Length: %zu\r\n",
-                              page->status_line, date, buffer_length(&html)) &&
-         (!location ||
-          buffer_appendf(out, "Location: %s\r\n", location)) &&
-         buffer_append_text(out, connection) &&
-         buffer_append(out, "\r\n", 2);
-    if (ok && with_body) {
-        ok = buffer_append(out, buffer_bytes(&html), buffer_length(&html));
+    int ok = (reply->status_line
+                  ? buffer_appendf(out, "HTTP/1.1 %s\r\n", reply->status_line)
+                  : buffer_appendf(out, "HTTP/1.1 %d %s\r\n", reply->status,
+                                   status_reason(reply->status))) &&
+             buffer_appendf(out,
+                            "Server: tinyproxy\r\n"
+                            "Date: %s\r\n",
+                            date);
+    for (size_t i = 0; ok && i < reply->headers.count; i++) {
+        const Header *header = &reply->headers.items[i];
+
+        if (!is_own_header(header->name)) {
+            ok = buffer_appendf(out, "%s: %s\r\n", header->name,
+                                header->value);
+        }
     }
-    buffer_free(&html);
+    ok = ok &&
+         buffer_appendf(out, "Content-Length: %zu\r\n",
+                        buffer_length(&reply->body)) &&
+         buffer_append_text(out, connection) && buffer_append(out, "\r\n", 2);
+    if (ok && with_body) {
+        ok = buffer_append(out, buffer_bytes(&reply->body),
+                           buffer_length(&reply->body));
+    }
     return ok;
 }

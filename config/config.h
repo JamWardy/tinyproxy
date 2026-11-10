@@ -62,11 +62,14 @@ typedef struct {
     OptionalSeconds keepalive_lifetime;
     // As in nginx, a block that sets any inherits none from around it.
     Headers proxy_set_headers;
+    // python_setting's. Each name is inherited unless the block sets it.
+    Headers python_settings;
     AccessLog access_log;
 } BlockSettings;
 
 // What applies once inherited. The headers and the log's descriptor are
-// borrowed from the block that wrote them.
+// borrowed from the block that wrote them, except python_settings' list,
+// which is its own, though its names and values are borrowed.
 typedef struct {
     double client_header_timeout;
     double client_body_timeout;
@@ -81,6 +84,7 @@ typedef struct {
     size_t keepalive_max_requests;
     double keepalive_lifetime;
     Headers proxy_set_headers;
+    Headers python_settings;
     AccessLog access_log;  // ACCESS_LOG_OFF or ACCESS_LOG_FILE.
 } Settings;
 
@@ -168,6 +172,8 @@ typedef struct {
     // Each on the heap, so a proxy_pass's pointer lasts as more are added.
     Upstream **upstreams;
     size_t upstream_count;
+    const char *python_path;    // Added to sys.path, or NULL.
+    const char *python_module;  // NULL for no Python.
 } Config;
 
 // On failure, error says why, with the file and line, and config_free must

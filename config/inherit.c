@@ -20,7 +20,37 @@ static double inherit_seconds(const OptionalSeconds *own, double outer) {
     return own->is_set ? own->seconds : outer;
 }
 
-static Settings inherit(const BlockSettings *own, const Settings *outer) {
+// Each name is inherited unless the block sets it. The list is new; its names
+// and values are borrowed.
+static int inherit_python_settings(const Headers *own, const Headers *outer,
+                                   Headers *out) {
+    out->items = NULL;
+    out->count = 0;
+    if (own->count + outer->count == 0) {
+        return 1;
+    }
+    out->items = malloc((own->count + outer->count) * sizeof(Header));
+    if (!out->items) {
+        return 0;
+    }
+    for (size_t i = 0; i < own->count; i++) {
+        out->items[out->count++] = own->items[i];
+    }
+    for (size_t i = 0; i < outer->count; i++) {
+        int replaced = 0;
+
+        for (size_t j = 0; j < own->count; j++) {
+            replaced |= strcmp(own->items[j].name, outer->items[i].name) == 0;
+        }
+        if (!replaced) {
+            out->items[out->count++] = outer->items[i];
+        }
+    }
+    return 1;
+}
+
+static int inherit(const BlockSettings *own, const Settings *outer,
+                   Settings *out) {
     Settings settings;
 
     settings.client_header_timeout =
@@ -61,7 +91,10 @@ static Settings inherit(const BlockSettings *own, const Settings *outer) {
     settings.access_log = own->access_log.kind != ACCESS_LOG_UNSET
                               ? own->access_log
                               : outer->access_log;
-    return settings;
+    *out = settings;
+    return inherit_python_settings(&own->python_settings,
+                                   &outer->python_settings,
+                                   &out->python_settings);
 }
 
 static Settings default_settings(void) {
@@ -82,6 +115,8 @@ static Settings default_settings(void) {
     settings.keepalive_lifetime = DEFAULT_KEEPALIVE_LIFETIME;
     settings.proxy_set_headers.items = NULL;
     settings.proxy_set_headers.count = 0;
+    settings.python_settings.items = NULL;
+    settings.python_settings.count = 0;
     settings.access_log.kind = ACCESS_LOG_OFF;
     settings.access_log.fd = -1;
     return settings;
@@ -121,23 +156,24 @@ static int build_proxy_headers(Location *location) {
 // reaches into it, as in nginx.
 int inherit_all(Config *config) {
     Settings defaults = default_settings();
-    Settings http = inherit(&config->http, &defaults);
+    Settings http;
+    int ok = inherit(&config->http, &defaults, &http);
 
-    for (size_t i = 0; i < config->server_count; i++) {
+    for (size_t i = 0; ok && i < config->server_count; i++) {
         Server *server = &config->servers[i];
 
-        server->settings = inherit(&server->written, &http);
-        for (size_t j = 0; j < server->location_count; j++) {
+        ok = inherit(&server->written, &http, &server->settings);
+        for (size_t j = 0; ok && j < server->location_count; j++) {
             Location *location = &server->locations[j];
 
-            location->settings = inherit(&location->written,
-                                         &server->settings);
-            if (!build_proxy_headers(location)) {
-                return 0;
-            }
+            ok = inherit(&location->written, &server->settings,
+                         &location->settings) &&
+                 build_proxy_headers(location);
         }
     }
-    return 1;
+    // Every server's has its own copy, so the http block's isn't needed.
+    free(http.python_settings.items);
+    return ok;
 }
 
 // ---- Grouping by address and port ----

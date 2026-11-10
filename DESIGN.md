@@ -162,7 +162,8 @@ nginx's statuses, with its small HTML page:
 Then it closes gently, as nginx's `lingering_close` does, so the client
 reads the reply before the connection drops, unless stage 5 keeps the
 connection. The gateway swaps these
-for Problem Details (stage 8), as Kong swaps nginx's pages for JSON.
+for Problem Details through stage 8's `error` hook, as Kong swaps
+nginx's pages for JSON.
 
 ## Logs
 
@@ -387,12 +388,126 @@ Each stage adds nginx's directives for it.
      as usual. It stops tinyproxy starting with `hash` or `ip_hash`
      (`invalid parameter "backup"`), whose keys must always land on the
      same endpoints.
-8. **Phases:** hooks at nginx's phases, which the gateway's Python
-   runs in, as OpenResty's `*_by_lua` directives do: access (allow it,
-   or answer here), balancer (pick the endpoint), header filter, body
-   filter and log. `error_page` sends tinyproxy's own errors to a hook,
-   as Kong's nginx config sends them to its Lua. The hooks run inside
-   the loop, so, as in OpenResty, they must never block.
+8. **Phases:** tinyproxy calls Python at fixed points in each request,
+   its phases, so the gateway can be written in Python, as OpenResty
+   lets Kong's Lua run at nginx's phases. Where OpenResty's way is
+   harder to follow, tinyproxy's is simpler:
+   - `python_module name;` in `http` imports one module at startup,
+     after `python_path dir;` in `http` has added its folder to
+     `sys.path`. The module's functions named after the phases below are
+     its hooks, and a phase it has no function for is skipped. A module
+     that won't import stops tinyproxy starting, with the traceback.
+     With no `python_module`, no Python runs. (OpenResty has a directive
+     per phase, such as `access_by_lua_block`, each naming its code.)
+   - `python_setting name value;` in `http`, `server` or `location`
+     gives the hooks `request.settings["name"]`, so a location can say
+     which of the gateway's plugins it uses. Each name is inherited
+     unless the block sets that name, as nginx's single-value directives
+     are, so a location can set `plugins` and keep the server's other
+     settings, and an empty value, such as `python_setting plugins "";`,
+     replaces an inherited one with nothing. (It isn't all or nothing, as
+     `proxy_set_header` is: nginx has that rule for its lists so it
+     needn't merge them, but settings have names to merge by.) One name
+     twice in a block stops it starting.
+   - The hooks, in the order they run:
+     - `init()`: once, at startup, before any connection. If it raises,
+       tinyproxy doesn't start.
+     - `access(request)`: once the request has its location, and the
+       location has a `proxy_pass`, before the body is read, as nginx's
+       access phase. `request.set_header(name, value)` changes a header
+       that goes upstream, after `proxy_set_header`'s, and `None`
+       removes one. `request.respond(status, headers=(), body=b"")`
+       answers here instead, and the body is then read and dropped, as
+       for a `404`. `request.responded` says whether it was called.
+     - `balancer(request, endpoints)`: each time an endpoint is chosen
+       for the request, including when stage 5 sends it again.
+       `endpoints` is the pool's, each with `address`
+       (`"127.0.0.1:8003"`), `host`, `weight`, `backup` and `down`. The
+       hook returns one of them, which is used even if it's down, full
+       or skipped, or `None` for the pool's own method. Either way,
+       passive health checks count its failures. (OpenResty's can send
+       to any address; tinyproxy keeps it to the pool, so the load
+       balancer always picks an endpoint of the pool.)
+     - `header_filter(request)`: once a reply's head is ready, before it
+       goes to the client: the upstream's, or tinyproxy's own (see "Its
+       own replies too" below). The hook can set `request.status`,
+       and edit `request.reply_headers`, a list of `(name, value)`
+       pairs, in place. `Server`, `Date`, `Connection` and `Keep-Alive`
+       are tinyproxy's own, so aren't in it. `Content-Length` and
+       `Transfer-Encoding` are, but they say where the body ends, so
+       tinyproxy sends them as they came whatever the hook does. A new
+       status keeps the upstream's body, so a `200` changed to `204`
+       still has one.
+     - `body_filter(request, data, last)`: for each piece of a reply's
+       body as it comes, out of any chunks, returning the
+       bytes to send in its place. `last` is `True` on the final call,
+       whose `data` may be empty. As the length may change, a filtered
+       body goes to the client without its `Content-Length`: chunked to
+       HTTP/1.1, and to HTTP/1.0 ending at the close. It isn't called
+       for a reply with no body. (OpenResty leaves the hook to remove
+       `Content-Length`, and a reply goes wrong when it forgets.) For
+       tinyproxy's own replies it differs: see below.
+     - `log(request)`: once the request is done, just before its access
+       log line, for every request that was read.
+     - `error(request, status)`: when tinyproxy is about to send its own
+       error, `400` or over, such as a `404` with no location or a `502`
+       from a failed upstream. It returns `(status, headers, body)` to
+       send instead, or `None` for tinyproxy's page. Whether the
+       connection is kept still goes by the first status. It isn't
+       called for `request.respond`'s replies, or for the upstream's own
+       errors. `header_filter` and `body_filter` see both. (nginx's `error_page` sends
+       errors to an internal location, and Kong's config points that at
+       its Lua; tinyproxy calls the hook straight away.)
+   - `request` is one object for the request's whole life, shared by
+     every hook call for it: `request.method`, `request.path` (`$path`),
+     `request.query` (`""` if there's none), `request.remote_addr`,
+     `request.headers` (a tuple of `(name, value)` pairs),
+     `request.settings`, a dict, and `request.state`, a dict the hooks
+     can keep things in from one phase to the next. `request.status` is
+     the reply's, once there is one. For a request that couldn't be
+     read, `error`, `header_filter`, `body_filter` and `log` get `None`
+     for what's missing. `set_header`
+     and `respond` work only in `access`, and setting `request.status`
+     only in `header_filter`; anywhere else they raise. After
+     `header_filter`, `request.reply_headers` is a tuple. Once the
+     request is done, everything on `request` but `state` raises.
+   - A reply from `respond` or `error` has the status, from 200 to 999,
+     with its usual words, the headers given as `(name, value)` pairs,
+     then tinyproxy's own `Server`, `Date`, `Content-Length` and
+     `Connection`. `body` is `bytes`, or a `str`, sent as UTF-8. A
+     `HEAD` gets no body. The connection is kept as for tinyproxy's own
+     reply with that status.
+   - Its own replies too: as in nginx, where every reply goes through
+     the same chain of header and body filters, `header_filter` and
+     `body_filter` run on tinyproxy's own replies as on an upstream's:
+     `request.respond`'s, `error`'s, tinyproxy's HTML pages, and stage
+     2's `301`. So a plugin that adds a header, such as CORS's, adds it
+     to the gateway's `401`s and `404`s too.
+     - `request.status` is the reply's, and `request.reply_headers` the
+       headers given to `respond` or returned by `error`, or for a page,
+       `Content-Type: text/html`, and `Location` for a `301`. As for an
+       upstream's, `Server`, `Date`, `Content-Length` and `Connection`
+       aren't in it. A changed status keeps the body; whether the
+       connection is kept still goes by the first status.
+     - The body is all in already, so `body_filter` is called once,
+       with all of it and `last` `True`, and what it returns goes with
+       an exact `Content-Length`, so it needs no chunks or close. It
+       isn't called for a `HEAD`.
+     - They run at most once for a request, so the `500` sent after one
+       raises, here or on an upstream's reply, skips them, rather than
+       raising again. `error` still runs for that `500`.
+   - A hook that raises has its traceback written to the error log.
+     Then, in `access`, `balancer` or `header_filter`, the client gets
+     `500`; in `body_filter`, the reply is cut off, or for tinyproxy's
+     own reply, which hasn't gone yet, the client gets `500`; in `error`,
+     tinyproxy's own page is sent; and in `log`, nothing else happens.
+   - The hooks run inside the loop, so, as in OpenResty, one that
+     blocks, such as on a socket or `time.sleep`, holds up every
+     connection. Nothing stops it. Timers and non-blocking sockets for
+     Python come with the gateway's active health checks.
+   - It's built on CPython's embedding API, with one interpreter,
+     started once the config is read. Python's own signal handlers are
+     left off, so Ctrl-C still stops the loop.
 11. **Caching:** nginx's `proxy_cache`, following the reply's
     `Cache-Control` and `Expires`.
 12. **Retries:** nginx's `proxy_next_upstream error timeout`: on a

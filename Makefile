@@ -3,8 +3,13 @@ CC ?= cc
 # macOS shows them anyway. compile_flags.txt repeats these, and the -I flags, for clangd.
 CFLAGS = -std=c99 -Wall -Wextra -Wpedantic -g -D_DEFAULT_SOURCE
 
-DIRS = config core http balance util
+DIRS = config core http balance util python
 CFLAGS += $(DIRS:%=-I%)
+
+# Stage 8 embeds CPython, through the python3 on the PATH.
+PYTHON_CONFIG ?= python3-config
+CFLAGS += $(shell $(PYTHON_CONFIG) --includes)
+LDLIBS += $(shell $(PYTHON_CONFIG) --ldflags --embed)
 
 SRCS = main.c \
        config/config.c config/parse.c config/directives.c \
@@ -13,7 +18,10 @@ SRCS = main.c \
        http/request.c http/proxy.c http/chunked.c http/uri.c \
        http/error_page.c http/http.c \
        balance/upstream.c balance/hash.c balance/keepalive.c \
-       util/buffer.c util/log.c util/variables.c
+       util/buffer.c util/log.c util/variables.c \
+       python/embed.c python/request_object.c \
+       python/request_attributes.c python/request_methods.c \
+       python/convert.c
 
 # Objects and .d files go in build/, in the same folders as their sources.
 OBJS = $(SRCS:%.c=build/%.o)
@@ -22,7 +30,7 @@ DEPS = $(OBJS:.o=.d)
 all: tinyproxy
 
 tinyproxy: $(OBJS)
-	$(CC) $(OBJS) -o $@
+	$(CC) $(OBJS) $(LDLIBS) -o $@
 
 # -MMD -MP write a .d file per object listing the headers it includes,
 # so editing a header rebuilds every .c file that uses it.

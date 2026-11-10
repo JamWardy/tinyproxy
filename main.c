@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "config.h"
+#include "embed.h"
 #include "loop.h"
 
 static int usage(void) {
@@ -23,7 +24,8 @@ int main(int argc, char **argv) {
         config_free(&config);
         return 1;
     }
-    int status = loop_run(&config);
+    int status = python_start(&config) ? loop_run(&config) : 1;
+    python_stop();
     config_free(&config);
     return status;
 }

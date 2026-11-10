@@ -24,6 +24,20 @@ typedef struct {
     size_t count;
 } Headers;
 
+// Copies name and value into headers, which then owns them, replacing any
+// header with that name, ignoring case. Fails only when out of memory.
+int headers_set_copy(Headers *headers, const char *name, const char *value);
+
+// Copies name and value onto the end of headers, which then owns them.
+// Fails only when out of memory.
+int headers_add_copy(Headers *headers, const char *name, const char *value);
+
+// Frees headers that own their names and values.
+void headers_free_copies(Headers *headers);
+
+// The status's usual words, such as "Not Found", or "Unknown".
+const char *status_reason(int status);
+
 // Cuts the next line off *text in place, at "\n" or "\r\n", and moves *text
 // past it. NULL once there are none left.
 char *next_line(char **text);

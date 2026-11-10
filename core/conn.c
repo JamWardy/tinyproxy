@@ -9,9 +9,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "embed.h"
 #include "error_page.h"
 #include "http.h"
 #include "log.h"
+#include "proxy.h"
 #include "route.h"
 #include "variables.h"
 
@@ -73,6 +75,8 @@ static void set_state(Connection *conn, ConnState state) {
 }
 
 static void close_conn(Connection *conn) {
+    request_object_done(conn);
+    headers_free_copies(&conn->headers_from_access);
     set_state(conn, CONN_UNUSED);
     close(conn->client_fd);
     buffer_free(&conn->from_client);
@@ -88,26 +92,6 @@ void conn_close(Connection *conn) {
 }
 
 // ---- Logs ----
-
-static void log_request(const Connection *conn) {
-    const AccessLog *log = &conn->settings->access_log;
-
-    if (log->kind != ACCESS_LOG_FILE) {
-        return;
-    }
-    AccessEntry entry;
-    entry.remote_addr = conn->remote_addr;
-    entry.time = time(NULL);
-    entry.request_line = conn->request.line;
-    entry.status = conn->status;
-    entry.body_bytes_sent =
-        conn->sent_to_client > conn->reply_head_length
-            ? conn->sent_to_client - conn->reply_head_length
-            : 0;
-    entry.referer = request_find_header(&conn->request, "Referer");
-    entry.user_agent = request_find_header(&conn->request, "User-Agent");
-    access_log_write(log->fd, &entry);
-}
 
 // About this request, at level, with nginx's details after it.
 static void log_conn(const Connection *conn, const char *level,
@@ -136,6 +120,40 @@ static void log_conn(const Connection *conn, const char *level,
               conn->id, message, conn->remote_addr,
               request->line ? request->line : "", upstream,
               request->host ? request->host : "");
+}
+
+// A hook raised: logs it here, then its traceback.
+static void hook_raised(const Connection *conn, Phase phase) {
+    log_conn(conn, "error", "python %s hook raised", phase_name(phase));
+    python_print_error();
+}
+
+// The request is done: runs the log hook, ends the request
+// object, and writes the access log
+// line.
+static void log_request(Connection *conn) {
+    const AccessLog *log = &conn->settings->access_log;
+
+    if (run_log(conn) == HOOK_RAISED) {
+        hook_raised(conn, PHASE_LOG);
+    }
+    request_object_done(conn);
+    headers_free_copies(&conn->headers_from_access);
+    if (log->kind != ACCESS_LOG_FILE) {
+        return;
+    }
+    AccessEntry entry;
+    entry.remote_addr = conn->remote_addr;
+    entry.time = time(NULL);
+    entry.request_line = conn->request.line;
+    entry.status = conn->status;
+    entry.body_bytes_sent =
+        conn->sent_to_client > conn->reply_head_length
+            ? conn->sent_to_client - conn->reply_head_length
+            : 0;
+    entry.referer = request_find_header(&conn->request, "Referer");
+    entry.user_agent = request_find_header(&conn->request, "User-Agent");
+    access_log_write(log->fd, &entry);
 }
 
 // The request has its answer, or never will: logs it, and closes.
@@ -241,6 +259,7 @@ static void reset_for_request(Connection *conn, double now) {
     conn->discard_left = 0;
     conn->body_rewrite = REWRITE_NONE;
     conn->keep_client = 0;
+    conn->filtered = 0;
     conn->status = 0;
     conn->reply_head_length = 0;
     conn->sent_to_client = 0;
@@ -307,24 +326,27 @@ static void reply_sent(Connection *conn, double now) {
 
 // ---- Own replies ----
 
-// tinyproxy's own reply in place of anything else, closing the upstream
-// connection if there is one. redirect is a 301's Location, or NULL.
-static void send_own_reply(Connection *conn, int status, const char *redirect,
-                           double now) {
-    const char *method = conn->request.method;
-    int with_body = !(method && strcmp(method, "HEAD") == 0);
-    char connection[80];
-
+// Starts tinyproxy's own reply, or a hook's, in place of anything else,
+// closing the upstream connection if there is one. Whether it keeps the
+// client's connection goes by status. Puts the Connection header lines in
+// connection.
+static void start_own_reply(Connection *conn, int status, char *connection,
+                            size_t size, double now) {
     set_state(conn, CONN_SENDING_OWN_REPLY);
     conn->keep_client =
         own_reply_keeps_client(status) && may_keep_client(conn, now);
-    connection_headers(conn, connection, sizeof(connection));
+    connection_headers(conn, connection, size);
     buffer_clear(&conn->to_client);
-    if (!build_own_reply(&conn->to_client, status, with_body, redirect,
-                         connection)) {
-        close_conn(conn);
-        return;
-    }
+}
+
+static int is_head_request(const Connection *conn) {
+    const char *method = conn->request.method;
+
+    return method && strcmp(method, "HEAD") == 0;
+}
+
+// The reply sent is in to_client, with status.
+static void own_reply_ready(Connection *conn, int status, double now) {
     conn->status = status == STATUS_HEADER_TOO_LARGE ? 400 : status;
     conn->reply_head_length = find_reply_head(buffer_bytes(&conn->to_client),
                                               buffer_length(&conn->to_client));
@@ -337,6 +359,106 @@ static void send_own_reply(Connection *conn, int status, const char *redirect,
         (void)send(conn->client_fd, CONTINUE, sizeof(CONTINUE) - 1, 0);
     }
     conn->client_io_at = now;
+}
+
+static void send_error(Connection *conn, int status, double now);
+
+// The header and body filters on one of tinyproxy's own replies, as on an
+// upstream's. The body is all in, so it's filtered in one call. Returns 0 if
+// a filter raised.
+static int filter_own_reply(Connection *conn, HookReply *reply,
+                            int with_body) {
+    if (conn->filtered) {
+        return 1;
+    }
+    conn->filtered = 1;
+    if (has_hook(PHASE_HEADER_FILTER)) {
+        Headers filtered = {NULL, 0};
+
+        conn->status = reply->status;
+        if (run_header_filter(conn, &reply->headers, &filtered) ==
+            HOOK_RAISED) {
+            headers_free_copies(&filtered);
+            hook_raised(conn, PHASE_HEADER_FILTER);
+            return 0;
+        }
+        headers_free_copies(&reply->headers);
+        reply->headers = filtered;
+        if (conn->status != reply->status) {
+            reply->status = conn->status;
+            reply->status_line = NULL;
+        }
+    }
+    if (with_body && has_hook(PHASE_BODY_FILTER)) {
+        Buffer filtered;
+
+        buffer_init(&filtered);
+        if (run_body_filter(conn, buffer_bytes(&reply->body),
+                            buffer_length(&reply->body), 1,
+                            &filtered) == HOOK_RAISED) {
+            buffer_free(&filtered);
+            hook_raised(conn, PHASE_BODY_FILTER);
+            return 0;
+        }
+        buffer_free(&reply->body);
+        reply->body = filtered;
+    }
+    return 1;
+}
+
+// Sends one of tinyproxy's own replies, after the filters. status is the
+// first one, before any hook changed it, which says whether the connection is
+// kept.
+static void send_filtered_reply(Connection *conn, int status,
+                                HookReply *reply, double now) {
+    int with_body = !is_head_request(conn);
+    char connection[80];
+
+    if (!filter_own_reply(conn, reply, with_body)) {
+        send_error(conn, 500, now);
+        return;
+    }
+    start_own_reply(conn, status, connection, sizeof(connection), now);
+    if (!build_hook_reply(&conn->to_client, reply, with_body, connection)) {
+        close_conn(conn);
+        return;
+    }
+    own_reply_ready(conn, reply->status, now);
+}
+
+// A reply from the access hook's request.respond.
+static void send_hook_reply(Connection *conn, HookReply *reply, double now) {
+    send_filtered_reply(conn, reply->status, reply, now);
+}
+
+// tinyproxy's own reply, or for an error, the error hook's if it gives one.
+// redirect is a 301's Location, or NULL.
+static void send_own_reply(Connection *conn, int status, const char *redirect,
+                           double now) {
+    HookReply reply;
+    HookResult result = HOOK_DONE;
+
+    hook_reply_init(&reply);
+    if (status >= 400 && has_hook(PHASE_ERROR)) {
+        result = run_error(conn,
+                           status == STATUS_HEADER_TOO_LARGE ? 400 : status,
+                           &reply);
+        if (result == HOOK_RAISED) {
+            hook_raised(conn, PHASE_ERROR);
+        }
+    }
+    if (result != HOOK_ANSWERED) {
+        // A hook that raised may have filled some of it.
+        hook_reply_free(&reply);
+        hook_reply_init(&reply);
+        if (!own_page_reply(&reply, status, redirect)) {
+            hook_reply_free(&reply);
+            close_conn(conn);
+            return;
+        }
+    }
+    send_filtered_reply(conn, status, &reply, now);
+    hook_reply_free(&reply);
 }
 
 static void send_error(Connection *conn, int status, double now) {
@@ -504,8 +626,8 @@ static int build_request(Connection *conn, Buffer *key) {
         build_upstream_request(
             &conn->to_upstream, &conn->request,
             buffer_bytes(&conn->upstream_uri),
-            conn->settings->proxy_http_version, &location->proxy_headers,
-            &variables,
+            conn->settings->proxy_http_version, &conn->headers_from_access,
+            &location->proxy_headers, &variables,
             buffer_bytes(&conn->from_client) + conn->head_length) &&
         (!key_template || expand_variables(key, key_template, &variables));
     buffer_free(&forwarded);
@@ -521,13 +643,22 @@ static void connect_upstream(Connection *conn, double now) {
 
     buffer_init(&key);
     int ok = build_request(conn, &key);
+    HookResult chosen = HOOK_DONE;
     if (ok) {
+        chosen = run_balancer(conn, upstream, &conn->endpoint);
+    }
+    if (chosen == HOOK_ANSWERED) {
+        use_endpoint(upstream, conn->endpoint, now);
+    } else if (ok && chosen == HOOK_DONE) {
         conn->endpoint = choose_endpoint(upstream, conn->remote_ip,
                                          buffer_bytes(&key),
                                          buffer_length(&key), now);
     }
     buffer_free(&key);
-    if (!ok) {
+    if (chosen == HOOK_RAISED) {
+        hook_raised(conn, PHASE_BALANCER);
+    }
+    if (!ok || chosen == HOOK_RAISED) {
         send_error(conn, 500, now);
         return;
     }
@@ -591,6 +722,28 @@ static void retry_or_fail_upstream(Connection *conn, int error_number,
     connect_upstream(conn, now);
 }
 
+// The access hook, which lets the request go on, or answers it. Returns
+// whether it goes on.
+static int allow_access(Connection *conn, double now) {
+    HookReply reply;
+
+    hook_reply_init(&reply);
+    HookResult result = run_access(conn, &reply);
+    switch (result) {
+        case HOOK_DONE:
+            break;
+        case HOOK_ANSWERED:
+            send_hook_reply(conn, &reply, now);
+            break;
+        case HOOK_RAISED:
+            hook_raised(conn, PHASE_ACCESS);
+            send_error(conn, 500, now);
+            break;
+    }
+    hook_reply_free(&reply);
+    return result == HOOK_DONE;
+}
+
 static void route_request(Connection *conn, double now) {
     conn->server = find_server(conn->group, conn->request.host);
     conn->settings = &conn->server->settings;
@@ -625,6 +778,11 @@ static void route_request(Connection *conn, double now) {
         log_conn(conn, "error", "client intended to send too large body: "
                                 "%zu bytes", conn->request.content_length);
         send_error(conn, 413, now);
+        return;
+    }
+    // Before the body, as nginx's access phase, so a refused request's body
+    // is dropped unread.
+    if (!allow_access(conn, now)) {
         return;
     }
 
@@ -818,10 +976,14 @@ static void finish_connecting(Connection *conn, double now) {
 }
 
 // How the body goes to this client: chunks it can't read are decoded, and
-// a body with no length of its own is chunked for one that can.
+// a body with no length of its own is chunked for one that can. A body
+// filter's body has no known length either.
 static BodyRewrite choose_body_rewrite(const Connection *conn) {
     int reads_chunks = conn->request.version >= HTTP_1_1;
 
+    if (conn->reply.framing != REPLY_NO_BODY && has_hook(PHASE_BODY_FILTER)) {
+        return reads_chunks ? REWRITE_FILTER_CHUNK : REWRITE_FILTER_TO_CLOSE;
+    }
     switch (conn->reply.framing) {
         case REPLY_NO_BODY:
         case REPLY_LENGTH:
@@ -837,6 +999,7 @@ static BodyRewrite choose_body_rewrite(const Connection *conn) {
 // The client can find the end of the body without the close.
 static int client_finds_end(const Connection *conn) {
     return conn->body_rewrite != REWRITE_DECHUNK &&
+           conn->body_rewrite != REWRITE_FILTER_TO_CLOSE &&
            !(conn->reply.framing == REPLY_UNTIL_CLOSE &&
              conn->body_rewrite == REWRITE_NONE);
 }
@@ -846,7 +1009,84 @@ typedef enum {
     BODY_DONE,
     BODY_INVALID,
     BODY_OUT_OF_MEMORY,
+    BODY_FILTER_RAISED,
 } BodyResult;
+
+static int is_filtered(const Connection *conn) {
+    return conn->body_rewrite == REWRITE_FILTER_CHUNK ||
+           conn->body_rewrite == REWRITE_FILTER_TO_CLOSE;
+}
+
+// Gives a piece of the body, out of any chunks, to the body filter, and what
+// it returns to the client.
+static BodyResult send_filtered(Connection *conn, const char *data,
+                                size_t size, int last) {
+    Buffer filtered;
+
+    if (size == 0 && !last) {
+        return BODY_MORE;
+    }
+    buffer_init(&filtered);
+    HookResult result = run_body_filter(conn, data, size, last, &filtered);
+    int ok = 1;
+    if (result == HOOK_DONE) {
+        ok = conn->body_rewrite == REWRITE_FILTER_CHUNK
+                 ? chunk_encode(&conn->to_client, buffer_bytes(&filtered),
+                                buffer_length(&filtered)) &&
+                       (!last || chunk_encode_end(&conn->to_client))
+                 : buffer_append(&conn->to_client, buffer_bytes(&filtered),
+                                 buffer_length(&filtered));
+    }
+    buffer_free(&filtered);
+    if (result == HOOK_RAISED) {
+        return BODY_FILTER_RAISED;
+    }
+    if (!ok) {
+        return BODY_OUT_OF_MEMORY;
+    }
+    return last ? BODY_DONE : BODY_MORE;
+}
+
+// pass_on_body's, for a body that goes through the body filter.
+static BodyResult filter_body(Connection *conn, const char *data, size_t size,
+                              size_t *used) {
+    *used = 0;
+    switch (conn->reply.framing) {
+        case REPLY_NO_BODY:
+            return BODY_DONE;
+        case REPLY_LENGTH: {
+            size_t run = size < conn->reply.length ? size : conn->reply.length;
+
+            *used = run;
+            conn->reply.length -= run;
+            return send_filtered(conn, data, run, conn->reply.length == 0);
+        }
+        case REPLY_CHUNKED: {
+            Buffer decoded;
+            BodyResult result = BODY_OUT_OF_MEMORY;
+
+            buffer_init(&decoded);
+            switch (chunk_decode(&conn->chunks, data, size, &decoded, used)) {
+                case CHUNKS_OK:
+                    result = send_filtered(conn, buffer_bytes(&decoded),
+                                           buffer_length(&decoded),
+                                           conn->chunks.state == CHUNK_DONE);
+                    break;
+                case CHUNKS_INVALID:
+                    result = BODY_INVALID;
+                    break;
+                case CHUNKS_OUT_OF_MEMORY:
+                    break;
+            }
+            buffer_free(&decoded);
+            return result;
+        }
+        case REPLY_UNTIL_CLOSE:
+            *used = size;
+            return send_filtered(conn, data, size, 0);
+    }
+    return BODY_MORE;
+}
 
 // Adds a piece of the reply's body to what goes to the client. *used says
 // how much of the piece was the body's.
@@ -854,6 +1094,9 @@ static BodyResult pass_on_body(Connection *conn, const char *data, size_t size,
                                size_t *used) {
     Buffer *out = &conn->to_client;
 
+    if (is_filtered(conn)) {
+        return filter_body(conn, data, size, used);
+    }
     *used = 0;
     switch (conn->reply.framing) {
         case REPLY_NO_BODY:
@@ -899,6 +1142,20 @@ static BodyResult pass_on_body(Connection *conn, const char *data, size_t size,
     return BODY_MORE;
 }
 
+// A filtered body that ends at the upstream's close: the filter's last call.
+// Fails if it raised or memory ran out.
+static int end_filtered(Connection *conn) {
+    switch (send_filtered(conn, "", 0, 1)) {
+        case BODY_FILTER_RAISED:
+            hook_raised(conn, PHASE_BODY_FILTER);
+            return 0;
+        case BODY_OUT_OF_MEMORY:
+            return 0;
+        default:
+            return 1;
+    }
+}
+
 // What the upstream sent past the reply, which is dropped, and keeps its
 // connection from being reused.
 static void log_extra_data(const Connection *conn) {
@@ -920,6 +1177,40 @@ static void upstream_reply_done(Connection *conn, int reusable, double now) {
     if (buffer_length(&conn->to_client) == 0) {
         reply_sent(conn, now);
     }
+}
+
+// Writes the upstream's reply head as the client gets it, after the header
+// filter. Returns 0 if the client got an error instead.
+static int write_reply_to_client(Connection *conn, size_t head, double now) {
+    ParsedReplyHead parsed;
+    Headers filtered = {NULL, 0};
+    char connection[80];
+
+    if (!split_reply_head(&parsed, buffer_bytes(&conn->from_upstream), head)) {
+        send_error(conn, 500, now);
+        return 0;
+    }
+    conn->filtered = 1;
+    if (run_header_filter(conn, &parsed.headers, &filtered) == HOOK_RAISED) {
+        parsed_reply_head_free(&parsed);
+        headers_free_copies(&filtered);
+        hook_raised(conn, PHASE_HEADER_FILTER);
+        send_error(conn, 500, now);
+        return 0;
+    }
+    conn->body_rewrite = choose_body_rewrite(conn);
+    conn->keep_client = may_keep_client(conn, now) && client_finds_end(conn);
+    connection_headers(conn, connection, sizeof(connection));
+    int ok = write_reply_head(
+        &conn->to_client, conn->status, &parsed,
+        has_hook(PHASE_HEADER_FILTER) ? &filtered : &parsed.headers,
+        conn->body_rewrite, connection);
+    parsed_reply_head_free(&parsed);
+    headers_free_copies(&filtered);
+    if (!ok) {
+        send_error(conn, 500, now);
+    }
+    return ok;
 }
 
 static void read_reply_head(Connection *conn, double now) {
@@ -963,14 +1254,8 @@ static void read_reply_head(Connection *conn, double now) {
                       reading, now);
         return;
     }
-    char connection[80];
     conn->status = conn->reply.status;
-    conn->body_rewrite = choose_body_rewrite(conn);
-    conn->keep_client = may_keep_client(conn, now) && client_finds_end(conn);
-    connection_headers(conn, connection, sizeof(connection));
-    if (!write_reply_head(&conn->to_client, buffer_bytes(in), head,
-                          conn->body_rewrite, connection)) {
-        send_error(conn, 500, now);
+    if (!write_reply_to_client(conn, head, now)) {
         return;
     }
     conn->reply_head_length = buffer_length(&conn->to_client);
@@ -1002,6 +1287,10 @@ static void read_reply_head(Connection *conn, double now) {
         case BODY_OUT_OF_MEMORY:
             send_error(conn, 500, now);
             return;
+        case BODY_FILTER_RAISED:
+            hook_raised(conn, PHASE_BODY_FILTER);
+            log_and_close(conn);
+            return;
     }
 }
 
@@ -1023,6 +1312,8 @@ static void read_reply(Connection *conn, double now) {
                 log_and_close(conn);
             } else if (conn->body_rewrite == REWRITE_CHUNK &&
                        !chunk_encode_end(&conn->to_client)) {
+                log_and_close(conn);
+            } else if (is_filtered(conn) && !end_filtered(conn)) {
                 log_and_close(conn);
             } else {
                 upstream_reply_done(conn, 0, now);
@@ -1058,6 +1349,10 @@ static void read_reply(Connection *conn, double now) {
         case BODY_OUT_OF_MEMORY:
             log_and_close(conn);
             return;
+        case BODY_FILTER_RAISED:
+            hook_raised(conn, PHASE_BODY_FILTER);
+            log_and_close(conn);
+            return;
     }
     conn->upstream_io_at = now;
     if (was_empty && buffer_length(&conn->to_client) > 0) {
@@ -1077,6 +1372,9 @@ void conn_start(Connection *conn, int fd, const struct sockaddr_in *client,
               sizeof(conn->remote_addr));
     conn->request_count = 0;
     conn->group = group;
+    conn->request_object = NULL;
+    conn->headers_from_access.items = NULL;
+    conn->headers_from_access.count = 0;
     buffer_init(&conn->from_client);
     request_init(&conn->request);
     buffer_init(&conn->upstream_uri);
